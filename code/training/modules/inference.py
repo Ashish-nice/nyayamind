@@ -25,6 +25,7 @@ import math
 import time
 import random
 import argparse
+import re
 import torch
 import threading
 from unsloth import FastLanguageModel
@@ -993,6 +994,141 @@ def _json_safe(value):
         return str(value)
 
 
+_PREDICTION_RE = re.compile(
+    r"##\s*PREDICTION\s*:\s*([01])\b", re.IGNORECASE
+)
+_CASE_CITATION_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9&'().,\- ]{1,100}\s+"
+    r"\bv(?:s?\.?)\s+"
+    r"[A-Z][A-Za-z0-9&'().,\- ]{1,100}"
+    r"(?=(?:\s*[,;(]|\s*$))",
+    re.IGNORECASE,
+)
+
+
+def _normalise_metric_text(value: str) -> str:
+    """Normalise citation text for comparison while retaining legal names."""
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def _clean_citation_candidate(value: str) -> str:
+    normalised = _normalise_metric_text(value)
+    return re.sub(
+        r"^(?:see|citing|following|in|under|case|the case of)\s+",
+        "",
+        normalised,
+    ).strip()
+
+
+def _parse_predicted_decision(text: str):
+    match = _PREDICTION_RE.search(text or "")
+    return int(match.group(1)) if match else None
+
+
+def _citation_candidates(text: str, known_citations) -> set:
+    """Extract known citations and case-name-shaped references from an output."""
+    output = text or ""
+    candidates = {
+        _clean_citation_candidate(match.group(0))
+        for match in _CASE_CITATION_RE.finditer(output)
+    }
+    for citation in known_citations or []:
+        normalised = _normalise_metric_text(citation)
+        if normalised and normalised in _normalise_metric_text(output):
+            candidates.add(normalised)
+    return candidates
+
+
+def _citation_metrics(text: str, known_citations) -> dict:
+    gold = {
+        _normalise_metric_text(citation)
+        for citation in (known_citations or [])
+        if _normalise_metric_text(citation)
+    }
+    predicted = _citation_candidates(text, known_citations)
+    overlap = predicted & gold
+    return {
+        "citation_overlap_precision": (
+            len(overlap) / len(predicted) if predicted else 0.0
+        ),
+        "citation_overlap_recall": (
+            len(overlap) / len(gold) if gold else 0.0
+        ),
+        "citation_hit": bool(overlap),
+        "citation_predicted_count": len(predicted),
+        "citation_gold_count": len(gold),
+    }
+
+
+def _decision_metrics(y_true, y_pred) -> dict:
+    """Compute binary Macro-F1 and MCC without adding a metrics dependency."""
+    pairs = [(truth, pred) for truth, pred in zip(y_true, y_pred)
+             if truth in (0, 1) and pred in (0, 1)]
+    if not pairs:
+        return {
+            "decision_macro_f1": float("nan"),
+            "decision_mcc": float("nan"),
+            "decision_valid_count": 0,
+        }
+
+    f1_scores = []
+    for label in (0, 1):
+        tp = sum(truth == label and pred == label for truth, pred in pairs)
+        fp = sum(truth != label and pred == label for truth, pred in pairs)
+        fn = sum(truth == label and pred != label for truth, pred in pairs)
+        denominator = 2 * tp + fp + fn
+        f1_scores.append(2 * tp / denominator if denominator else 0.0)
+
+    tp = sum(truth == 1 and pred == 1 for truth, pred in pairs)
+    tn = sum(truth == 0 and pred == 0 for truth, pred in pairs)
+    fp = sum(truth == 0 and pred == 1 for truth, pred in pairs)
+    fn = sum(truth == 1 and pred == 0 for truth, pred in pairs)
+    denominator = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn - fp * fn) / denominator) if denominator else 0.0
+    return {
+        "decision_macro_f1": sum(f1_scores) / 2,
+        "decision_mcc": mcc,
+        "decision_valid_count": len(pairs),
+    }
+
+
+def _aggregate_inference_metrics(records: list) -> dict:
+    y_true = []
+    y_pred = []
+    precision_values = []
+    recall_values = []
+    hit_values = []
+    for record in records:
+        truth = record.get("Simplified_Decision")
+        try:
+            truth = int(str(truth).strip())
+        except (TypeError, ValueError):
+            truth = None
+        prediction = record.get("predicted_decision")
+        if truth in (0, 1) and prediction in (0, 1):
+            y_true.append(truth)
+            y_pred.append(prediction)
+        precision_values.append(record["citation_overlap_precision"])
+        recall_values.append(record["citation_overlap_recall"])
+        hit_values.append(float(record["citation_hit"]))
+
+    metrics = _decision_metrics(y_true, y_pred)
+    metrics.update({
+        "citation_overlap_precision": (
+            sum(precision_values) / len(precision_values)
+            if precision_values else 0.0
+        ),
+        "citation_overlap_recall": (
+            sum(recall_values) / len(recall_values)
+            if recall_values else 0.0
+        ),
+        "citation_hit_rate": (
+            sum(hit_values) / len(hit_values) if hit_values else 0.0
+        ),
+    })
+    return metrics
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -1134,6 +1270,7 @@ def _eval_loop(model, tokenizer, rows, args, device, logger,
 
     t0 = time.time()
     completed = 0
+    metric_records = []
     for start in range(0, n, args.eval_batch_size):
         end = min(start + args.eval_batch_size, n)
         outputs = _generate_batch(model, tokenizer, prompts[start:end], args, device, logger, start)
@@ -1147,16 +1284,24 @@ def _eval_loop(model, tokenizer, rows, args, device, logger,
             rec = {k: _json_safe(v) for k, v in row.items()}
             rec["finetuned_model_output"] = text
             rec["per_sample_loss"] = losses[start + j]
+            rec["predicted_decision"] = _parse_predicted_decision(text)
+            rec.update(_citation_metrics(text, row.get("cited_cases", [])))
             batch_records.append(rec)
 
         writer.write_batch(batch_records)
+        metric_records.extend(batch_records)
         completed += len(batch_records)
         elapsed = time.time() - t0
         rate = completed / elapsed
         eta_str = f" | ETA full: {_fmt(n_full / rate)}" if n_full else ""
         logger.info(f"  [{label}] batch [{completed}/{n}] {rate:.2f} rows/s{eta_str}")
 
-    writer.close(footer={"aggregate_loss": agg_loss, "aggregate_ppl": agg_ppl})
+    aggregate_metrics = _aggregate_inference_metrics(metric_records)
+    writer.close(footer={
+        "aggregate_loss": agg_loss,
+        "aggregate_ppl": agg_ppl,
+        **aggregate_metrics,
+    })
     return agg_loss, agg_ppl, time.time() - t0
 
 # ---------------------------------------------------------------------------
