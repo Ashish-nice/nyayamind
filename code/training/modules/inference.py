@@ -994,70 +994,9 @@ def _json_safe(value):
         return str(value)
 
 
-_PREDICTION_RE = re.compile(
-    r"##\s*PREDICTION\s*:\s*([01])\b", re.IGNORECASE
-)
-_CASE_CITATION_RE = re.compile(
-    r"\b[A-Z][A-Za-z0-9&'().,\- ]{1,100}\s+"
-    r"\bv(?:s?\.?)\s+"
-    r"[A-Z][A-Za-z0-9&'().,\- ]{1,100}"
-    r"(?=(?:\s*[,;(]|\s*$))",
-    re.IGNORECASE,
-)
-
-
-def _normalise_metric_text(value: str) -> str:
-    """Normalise citation text for comparison while retaining legal names."""
-    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
-
-
-def _clean_citation_candidate(value: str) -> str:
-    normalised = _normalise_metric_text(value)
-    return re.sub(
-        r"^(?:see|citing|following|in|under|case|the case of)\s+",
-        "",
-        normalised,
-    ).strip()
-
-
 def _parse_predicted_decision(text: str):
-    match = _PREDICTION_RE.search(text or "")
+    match = re.search(r"##\s*PREDICTION\s*:\s*([01])\b", text or "", re.IGNORECASE)
     return int(match.group(1)) if match else None
-
-
-def _citation_candidates(text: str, known_citations) -> set:
-    """Extract known citations and case-name-shaped references from an output."""
-    output = text or ""
-    candidates = {
-        _clean_citation_candidate(match.group(0))
-        for match in _CASE_CITATION_RE.finditer(output)
-    }
-    for citation in known_citations or []:
-        normalised = _normalise_metric_text(citation)
-        if normalised and normalised in _normalise_metric_text(output):
-            candidates.add(normalised)
-    return candidates
-
-
-def _citation_metrics(text: str, known_citations) -> dict:
-    gold = {
-        _normalise_metric_text(citation)
-        for citation in (known_citations or [])
-        if _normalise_metric_text(citation)
-    }
-    predicted = _citation_candidates(text, known_citations)
-    overlap = predicted & gold
-    return {
-        "citation_overlap_precision": (
-            len(overlap) / len(predicted) if predicted else 0.0
-        ),
-        "citation_overlap_recall": (
-            len(overlap) / len(gold) if gold else 0.0
-        ),
-        "citation_hit": bool(overlap),
-        "citation_predicted_count": len(predicted),
-        "citation_gold_count": len(gold),
-    }
 
 
 def _decision_metrics(y_true, y_pred) -> dict:
@@ -1095,9 +1034,6 @@ def _decision_metrics(y_true, y_pred) -> dict:
 def _aggregate_inference_metrics(records: list) -> dict:
     y_true = []
     y_pred = []
-    precision_values = []
-    recall_values = []
-    hit_values = []
     for record in records:
         truth = record.get("Simplified_Decision")
         try:
@@ -1108,25 +1044,8 @@ def _aggregate_inference_metrics(records: list) -> dict:
         if truth in (0, 1) and prediction in (0, 1):
             y_true.append(truth)
             y_pred.append(prediction)
-        precision_values.append(record["citation_overlap_precision"])
-        recall_values.append(record["citation_overlap_recall"])
-        hit_values.append(float(record["citation_hit"]))
 
-    metrics = _decision_metrics(y_true, y_pred)
-    metrics.update({
-        "citation_overlap_precision": (
-            sum(precision_values) / len(precision_values)
-            if precision_values else 0.0
-        ),
-        "citation_overlap_recall": (
-            sum(recall_values) / len(recall_values)
-            if recall_values else 0.0
-        ),
-        "citation_hit_rate": (
-            sum(hit_values) / len(hit_values) if hit_values else 0.0
-        ),
-    })
-    return metrics
+    return _decision_metrics(y_true, y_pred)
 
 
 # ---------------------------------------------------------------------------
@@ -1146,8 +1065,8 @@ def _get_args():
     p.add_argument("--load_in_4bit", action="store_true")
     p.add_argument("--load_in_8bit", action="store_true")
     p.add_argument("--multi_gpu", action="store_true")
-    p.add_argument("--max_seq_length", type=int, default=8192)
-    p.add_argument("--max_new_tokens", type=int, default=1024)
+    p.add_argument("--max_seq_length", type=int, default=16384)
+    p.add_argument("--max_new_tokens", type=int, default=4096)
     p.add_argument("--logging_dir", type=str, default="./logs")
     p.add_argument("--dataset_dir", type=str, default="./dataset")
     p.add_argument("--eval_batch_size", type=int, default=1)
@@ -1285,7 +1204,6 @@ def _eval_loop(model, tokenizer, rows, args, device, logger,
             rec["finetuned_model_output"] = text
             rec["per_sample_loss"] = losses[start + j]
             rec["predicted_decision"] = _parse_predicted_decision(text)
-            rec.update(_citation_metrics(text, row.get("cited_cases", [])))
             batch_records.append(rec)
 
         writer.write_batch(batch_records)
