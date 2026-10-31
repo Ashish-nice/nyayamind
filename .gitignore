@@ -209,3 +209,4 @@ __marimo__/
 #data folders
 data/
 model/final_model/
+logs/
