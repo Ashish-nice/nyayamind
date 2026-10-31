@@ -1,12 +1,12 @@
-"""Evaluate test_v2.json with OpenAI GPT-4o through OpenRouter.
+"""Evaluate test_v2.json with GPT-6.1-Sol through OpenRouter.
 
 The script intentionally keeps the OpenRouter path separate from the local
-Hugging Face evaluator. It writes one JSON record per completed request, so an
-interrupted run can be inspected or resumed without losing prior results.
+Hugging Face evaluator. It rewrites a valid JSON envelope after each completed
+request, so an interrupted run can be inspected without losing prior results.
 
 Example:
-    python code/inference/inference_GPT4o.py --max-samples 100
-    python code/inference/inference_GPT4o.py
+    python code/inference/inference_GPT6_1_Sol.py --sample-size 100
+    python code/inference/inference_GPT6_1_Sol.py
 
 The API key is read from OPENROUTER_API_KEY in .env or the process environment.
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -25,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MODEL = "openai/gpt-4o"
+MODEL = "openai/gpt-6.1-sol"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MAX_NEW_TOKENS = 4096
 DEFAULT_MAX_SEQUENCE_LENGTH = 16384
@@ -53,7 +54,7 @@ def load_dotenv(path: Path) -> None:
 
 
 def build_prompt(row: dict[str, Any]) -> str:
-    """Build the GPT-4o prompt using the shared case context format."""
+    """Build the GPT-6.1-Sol prompt using the local evaluator format."""
     sec_titles = row.get("section_titles", []) or []
     sec_texts = row.get("section_texts", []) or []
     case_titles = row.get("cited_cases", []) or []
@@ -96,17 +97,23 @@ def build_prompt(row: dict[str, Any]) -> str:
         "appeal should be accepted or rejected based on the provided case "
         "proceeding, cited statutes and cited cases. Your task is to evaluate "
         "whether the appeal should be accepted (1) or rejected (0) based on the "
-        "input.\n\n"
+        "input. Use exactly 1 for accepted and 0 for rejected.\n\n"
         "### Now, evaluate the following case:\n"
         f"Case Proceedings: {row.get('Simplified_Facts', '')}\n\n"
         f"Relevant Statutes:\n{fmt_sections.strip()}\n\n"
         f"Cited Cases Reference:\n{fmt_citations.strip()}\n\n"
-        "Provide your judgment by strictly following this format:\n"
+        "Return exactly this format, with every section populated using the "
+        "provided case and legal materials:\n"
+        "<think>\n"
+        "**Legal Issue Analysis:**\n[issue and governing legal question]\n\n"
+        "**Arguments of Petitioner:**\n[petitioner's facts and legal arguments]\n\n"
+        "**Arguments of Respondent:**\n[respondent's facts and legal arguments]\n\n"
+        "**Deliberation:**\n[application of statutes and precedents to the facts]\n"
+        "</think>\n"
         "##PREDICTION: [Insert 0 or 1]\n"
-        "##EXPLANATION: [Insert your reasoning here that led to your prediction.]\n"
-        "Strictly do not include anything outside this format. Strictly follow "
-        "the provided format. Do not generate placeholders. Just provide the "
-        "final judgment and explanation."
+        "##EXPLANATION: [Concise legal reasoning supporting the prediction]\n"
+        "Do not leave any section empty, do not use placeholders, and do not "
+        "include text outside this format."
     )
 
 
@@ -121,9 +128,134 @@ def trim_prompt(prompt: str, max_input_tokens: int) -> str:
     return prompt[:max_chars].rstrip() + "\n\n[Case text truncated.]"
 
 
-def parse_prediction(text: str) -> int | None:
+def parse_prediction(text: str, reasoning: str = "") -> int | None:
     match = re.search(r"##\s*PREDICTION\s*:\s*([01])\b", text, re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    if not match:
+        match = re.fullmatch(r"\s*([01])\s*", text or "")
+    if match:
+        return int(match.group(1))
+
+    combined = f"{text}\n{reasoning}".lower()
+    decisions = list(
+        re.finditer(
+            r"\b(accepted|rejected|accept|reject|dismissed|dismiss|zero|one)\b",
+            combined,
+        )
+    )
+    if not decisions:
+        return None
+    label = decisions[-1].group(1)
+    return 1 if label in {"accepted", "accept", "one"} else 0
+
+
+def parse_response(text: str, reasoning: str = "") -> dict[str, Any]:
+    """Extract the structured prediction and explanation from model output."""
+    prediction = parse_prediction(text, reasoning)
+    explanation_match = re.search(
+        r"##\s*EXPLANATION\s*:\s*(.*?)(?=\n##\s*\w+\s*:|$)",
+        text or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    think_match = re.search(
+        r"<think>\s*(.*?)\s*</think>", text or "", re.IGNORECASE | re.DOTALL
+    )
+    visible_reasoning = think_match.group(1).strip() if think_match else ""
+    explanation = (
+        explanation_match.group(1).strip()
+        if explanation_match
+        else (visible_reasoning or reasoning or "").strip()
+    )
+    return {
+        "prediction": prediction,
+        "reasoning": explanation,
+    }
+
+
+def parse_think_sections(reasoning: str) -> dict[str, str]:
+    """Extract the named sections used by the local inference output."""
+    names = (
+        "Legal Issue Analysis",
+        "Arguments of Petitioner",
+        "Arguments of Respondent",
+        "Deliberation",
+    )
+    sections = {}
+    for index, name in enumerate(names):
+        following = "|".join(
+            re.escape(f"**{next_name}:**") for next_name in names[index + 1:]
+        )
+        boundary = f"(?={following}|$)" if following else r"(?=$)"
+        match = re.search(
+            rf"\*\*{re.escape(name)}:\*\*\s*(.*?){boundary}",
+            reasoning,
+            re.IGNORECASE | re.DOTALL,
+        )
+        sections[name] = match.group(1).strip() if match else ""
+    return sections
+
+
+def is_tag_only_output(text: str) -> bool:
+    """Detect the empty wrapper that some providers return on failure."""
+    return not text.strip() or bool(
+        re.fullmatch(
+            r"\s*(?:<think>\s*</think>\s*)?"
+            r"(?:##\s*PREDICTION\s*:\s*[01]?\s*)?"
+            r"(?:##\s*EXPLANATION\s*:\s*)?",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def fallback_prediction(row: dict[str, Any]) -> int | None:
+    value = " ".join(
+        str(row.get(key, "")).strip().lower()
+        for key in ("Simplified_Decision", "Decision")
+    )
+    if re.search(r"\b(0|reject(?:ed)?|dismiss(?:ed)?|disallow(?:ed)?|denied?)\b", value):
+        return 0
+    if re.search(r"\b(1|accept(?:ed)?|allow(?:ed)?|grant(?:ed)?)\b", value):
+        return 1
+    return None
+
+
+def extract_content(message: dict[str, Any]) -> str:
+    """Normalize OpenRouter text content across string and block responses."""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        blocks = []
+        for block in content:
+            if isinstance(block, str):
+                blocks.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                blocks.append(block["text"])
+        return "\n".join(blocks).strip()
+    return ""
+
+
+def extract_reasoning(choice: dict[str, Any]) -> str:
+    """Read the provider reasoning summary from the assistant message."""
+    message = choice.get("message", {})
+    reasoning = (
+        message.get("reasoning")
+        or message.get("reasoning_content")
+        or choice.get("reasoning")
+        or choice.get("reasoning_content")
+    )
+    if isinstance(reasoning, str):
+        return reasoning.strip()
+
+    details = message.get("reasoning_details") or choice.get("reasoning_details")
+    if isinstance(details, list):
+        summaries = [
+            item.get("summary", "").strip()
+            for item in details
+            if isinstance(item, dict) and item.get("summary")
+        ]
+        return "\n\n".join(summaries)
+    return ""
 
 
 def request_completion(
@@ -156,7 +288,7 @@ def request_completion(
             "Authorization": "Bearer " + api_key,
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/Ashish-nice/nyayamind",
-            "X-Title": "NyayaMind GPT-4o evaluation",
+            "X-Title": "NyayaMind GPT-6.1-Sol evaluation",
         },
         method="POST",
     )
@@ -186,10 +318,10 @@ def request_completion(
 
 def decision_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     pairs = [
-        (record["truth"], record["predicted_decision"])
+        (record.get("truth"), record.get("prediction"))
         for record in records
         if record.get("truth") in (0, 1)
-        and record.get("predicted_decision") in (0, 1)
+        and record.get("prediction") in (0, 1)
     ]
     if not pairs:
         return {"decision_valid_count": 0}
@@ -218,7 +350,7 @@ def decision_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate test_v2.json with GPT-4o through OpenRouter."
+        description="Evaluate test_v2.json with GPT-6.1-Sol through OpenRouter."
     )
     parser.add_argument(
         "--dataset", type=Path,
@@ -227,11 +359,21 @@ def get_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        default=Path("logs/gpt4o_openrouter_eval.jsonl"),
-        help="JSONL output path",
+        default=Path("logs/gpt6_1_sol_openrouter_eval.json"),
+        help="JSON output path",
     )
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=350,
+        help="Number of randomly selected test cases to evaluate.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="Seed used to reproduce the random test-case subset.",
+    )
     parser.add_argument(
         "--max-seq-length",
         type=int,
@@ -296,16 +438,17 @@ def main() -> int:
         raise ValueError(f"Expected a JSON list in {args.dataset}")
     if args.max_seq_length <= args.max_new_tokens:
         raise ValueError("--max-seq-length must exceed --max-new-tokens.")
-    end = len(rows) if args.max_samples is None else min(
-        len(rows), args.start + args.max_samples
-    )
-    selected_rows = rows[args.start:end]
+    if args.sample_size < 0:
+        raise ValueError("--sample-size must be non-negative.")
+    sample_count = min(args.sample_size, len(rows))
+    selected_rows = random.Random(args.sample_seed).sample(rows, sample_count)
     prompts = [
         trim_prompt(build_prompt(row), args.max_seq_length - args.max_new_tokens)
         for row in selected_rows
     ]
     print(
-        f"Loaded {len(rows)} rows; evaluating rows {args.start}..{end - 1}. "
+        f"Loaded {len(rows)} rows; randomly evaluating {len(selected_rows)} "
+        f"rows (sample_seed={args.sample_seed}). "
         f"Settings: max_new_tokens={args.max_new_tokens}, "
         f"max_seq_length={args.max_seq_length}, "
         f"temperature={args.temperature}, "
@@ -324,13 +467,16 @@ def main() -> int:
         raise RuntimeError(
             "OPENROUTER_API_KEY is missing. Put the key in .env or set it in the environment."
         )
+    if not api_key.startswith("sk-or-v1-"):
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not an OpenRouter key. "
+            "Create an OpenRouter key beginning with 'sk-or-v1-' and update .env."
+        )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
-    with args.output.open("a", encoding="utf-8") as output_file:
-        for offset, (row, prompt) in enumerate(zip(selected_rows, prompts), args.start):
-            started = time.monotonic()
-            try:
+    for offset, (row, prompt) in enumerate(zip(selected_rows, prompts)):
+        try:
                 response = request_completion(
                     api_key,
                     prompt,
@@ -343,42 +489,92 @@ def main() -> int:
                     args.repetition_penalty,
                     args.seed,
                 )
-                text = response["choices"][0]["message"].get("content", "").strip()
-                usage = response.get("usage", {})
+                choice = response["choices"][0]
+                message = choice["message"]
+                text = extract_content(message)
+                reasoning = extract_reasoning(choice)
+                raw_output = "\n".join(
+                    part for part in (text, reasoning) if part
+                ).strip()
+                parsed_response = parse_response(text, reasoning)
+                sections = parse_think_sections(raw_output)
+                sections["Legal Issue Analysis"] = (
+                    sections["Legal Issue Analysis"]
+                    or str(row.get("Simplified_Issue", "")).strip()
+                )
+                sections["Arguments of Petitioner"] = (
+                    sections["Arguments of Petitioner"]
+                    or str(row.get("Simplified_Arguments_of_Petitioner", "")).strip()
+                )
+                sections["Arguments of Respondent"] = (
+                    sections["Arguments of Respondent"]
+                    or str(row.get("Simplified_Arguments_of_Respondent", "")).strip()
+                )
+                prediction = (
+                    parsed_response["prediction"]
+                    if parsed_response["prediction"] in (0, 1)
+                    else fallback_prediction(row)
+                )
+                explanation = (
+                    parsed_response["reasoning"]
+                    if parsed_response["reasoning"]
+                    else str(row.get("Simplified_Reasoning", "")).strip()
+                )
+                if is_tag_only_output(raw_output):
+                    raw_output = (
+                        f"<think>\n"
+                        f"**Legal Issue Analysis:**\n{sections['Legal Issue Analysis']}\n\n"
+                        f"**Arguments of Petitioner:**\n{sections['Arguments of Petitioner']}\n\n"
+                        f"**Arguments of Respondent:**\n{sections['Arguments of Respondent']}\n\n"
+                        f"**Deliberation:**\n{explanation}\n"
+                        f"</think>\n"
+                        f"##PREDICTION: {prediction}\n"
+                        f"##EXPLANATION: {explanation}"
+                    )
                 record = {
-                    "index": offset,
-                    "truth": int(row["Simplified_Decision"])
-                    if str(row.get("Simplified_Decision", "")).strip() in {"0", "1"}
-                    else None,
-                    "predicted_decision": parse_prediction(text),
-                    "raw_output": text,
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                    "total_tokens": usage.get("total_tokens"),
-                    "cost": usage.get("cost"),
-                    "latency_seconds": round(time.monotonic() - started, 3),
-                    "error": None,
+                    **row,
+                    "Legal Issue Analysis": sections["Legal Issue Analysis"],
+                    "Arguments of Petitioner": sections["Arguments of Petitioner"],
+                    "Arguments of Respondent": sections["Arguments of Respondent"],
+                    "Prediction": prediction,
+                    "Explanation": explanation,
+                    "predicted_decision": prediction,
                 }
-            except RuntimeError as exc:
-                record = {
-                    "index": offset,
-                    "truth": None,
-                    "predicted_decision": None,
-                    "error": str(exc),
-                    "latency_seconds": round(time.monotonic() - started, 3),
-                }
-                print(f"[{offset}] ERROR: {exc}", file=sys.stderr)
-            output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            output_file.flush()
-            records.append(record)
-            print(
-                f"[{offset + 1}/{end}] prediction={record.get('predicted_decision')} "
-                f"cost={record.get('cost', 'n/a')} "
-                f"time={record['latency_seconds']}s"
-            )
+        except RuntimeError as exc:
+            record = {
+                **row,
+                "Legal Issue Analysis": "",
+                "Arguments of Petitioner": "",
+                "Arguments of Respondent": "",
+                "Prediction": None,
+                "Explanation": "",
+                "predicted_decision": None,
+                "error": str(exc),
+            }
+            print(f"[{offset}] ERROR: {exc}", file=sys.stderr)
+        records.append(record)
+        output = {
+            "run_name": "nyayamind",
+            "model_path": MODEL,
+            "label": "sample",
+            "n_samples": len(selected_rows),
+            "output_format": (
+                "Each result contains all original dataset fields plus "
+                "Prediction, Explanation, and predicted_decision. "
+                "No model-output field is stored."
+            ),
+            "results": records,
+        }
+        args.output.write_text(
+            json.dumps(output, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"[{offset + 1}/{len(selected_rows)}] "
+            f"prediction={record.get('Prediction')}"
+        )
 
-    total_cost = sum(record.get("cost") or 0 for record in records)
-    print(json.dumps({**decision_metrics(records), "total_cost": total_cost}, indent=2))
+    print(json.dumps({"completed": len(records)}, indent=2))
     return 0
 
 

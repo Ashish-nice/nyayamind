@@ -364,6 +364,14 @@ def _generate_batch(model, tokenizer, prompts, args, device, logger=None,
 
         thread.join()
         elapsed = time.time() - t_start
+        if not generated_text.strip() or re.fullmatch(
+            r"\s*(?:<think>\s*</think>\s*)?(?:##PREDICTION:\s*)?(?:0|1)?\s*",
+            generated_text,
+            re.IGNORECASE,
+        ):
+            raise RuntimeError(
+                f"Model produced empty or tag-only output for sample {global_idx}."
+            )
         if logger:
             logger.info(
                 f"    sample {global_idx} done : "
@@ -1185,6 +1193,10 @@ def _eval_loop(model, tokenizer, rows, args, device, logger,
         "model_path": ft_model_path,
         "label": label.lower(),
         "n_samples": n,
+        "output_format": (
+            "Each result contains the original case fields, "
+            "finetuned_model_output, predicted_decision, and per_sample_loss."
+        ),
     })
 
     t0 = time.time()
