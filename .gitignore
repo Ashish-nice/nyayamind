@@ -210,3 +210,4 @@ __marimo__/
 data/
 model/final_model/
 logs/
+evaluation_results/
