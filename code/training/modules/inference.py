@@ -1077,6 +1077,8 @@ def _get_args():
     p.add_argument("--max_new_tokens", type=int, default=4096)
     p.add_argument("--logging_dir", type=str, default="./logs")
     p.add_argument("--dataset_dir", type=str, default="./dataset")
+    p.add_argument("--start_case", type=int, default=1,
+                   help="1-based case number to start evaluating from")
     p.add_argument("--eval_batch_size", type=int, default=1)
     p.add_argument("--heartbeat_tokens", type=int, default=50)
     p.add_argument("--pilot_size", type=int, default=100)
@@ -1096,6 +1098,8 @@ def _get_args():
         p.error("--load_in_4bit and --load_in_8bit are mutually exclusive.")
     if not args.load_in_4bit and not args.load_in_8bit and not args.full_precision:
         args.load_in_4bit = True
+    if args.start_case < 1:
+        p.error("--start_case must be at least 1.")
     return args
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1257,7 @@ def run_base_eval(args, logger):
 
     # 3. Load dataset
     all_rows = list(_load_raw_test(args.dataset_dir))
+    all_rows = all_rows[args.start_case - 1:]
     n_total = len(all_rows)
     os.makedirs(args.logging_dir, exist_ok=True)
 

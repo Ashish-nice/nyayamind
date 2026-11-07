@@ -103,6 +103,8 @@ def _get_args():
                    help="Directory where output JSON files are written")
     p.add_argument("--dataset_dir", type=str, default="./dataset",
                    help="Directory containing test_v2.json")
+    p.add_argument("--start_case", type=int, default=1,
+                   help="1-based case number to start evaluating from")
     p.add_argument("--eval_batch_size", type=int, default=1,
                    help="Batch size for generation. Loss pass is always 1. "
                         "Try 2-4 for a 14B 4-bit model if VRAM allows.")
@@ -132,6 +134,8 @@ def _get_args():
         args.load_in_4bit = True  # default only when no precision flag given
     if args.pilot_only and args.skip_pilot:
         p.error("--pilot_only and --skip_pilot are mutually exclusive.")
+    if args.start_case < 1:
+        p.error("--start_case must be at least 1.")
     return args
 
 
@@ -348,8 +352,9 @@ def run_base_eval(args, logger):
 
     # Load full test set
     all_rows = list(_load_raw_test(args.dataset_dir))
+    all_rows = all_rows[args.start_case - 1:]
     n_total  = len(all_rows)
-    logger.info(f"Full test size  : {n_total} rows")
+    logger.info(f"Full test size  : {n_total} rows (starting at case {args.start_case})")
     os.makedirs(args.logging_dir, exist_ok=True)
 
     pilot_path = os.path.join(args.logging_dir, "base_eval_pilot.json")

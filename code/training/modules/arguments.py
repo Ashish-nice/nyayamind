@@ -76,6 +76,8 @@ def get_args():
     data_group = parser.add_argument_group("Dataset")
     data_group.add_argument("--dataset_dir", type=str, default="dataset/", help="Directory of the dataset")
     data_group.add_argument("--max_new_tokens", type=int, default=2048, help="Max tokens for target masking")
+    data_group.add_argument("--start_case", type=int, default=1,
+                            help="1-based case number to start evaluating from")
 
     args = parser.parse_args()
     
@@ -85,6 +87,9 @@ def get_args():
     
     if args.train_phi4 and args.train_qwen3:
         raise ValueError("Cannot set BOTH --train_phi4 and --train_qwen3. Choose one.")
+
+    if args.start_case < 1:
+        raise ValueError("--start_case must be at least 1.")
     
     # # Default to 4-bit if neither is specified (Safe default for Unsloth)
     # # Skip this default when using Phi-4 — let user choose explicitly

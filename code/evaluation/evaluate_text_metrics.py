@@ -5,12 +5,17 @@ It aligns records by ``document_id`` (falling back to ``Case Name``), reads
 large JSON arrays incrementally, and writes per-example plus cumulative
 metrics.  By default it compares ``Explanation`` with
 ``Simplified_Reasoning``.  Use ``--prediction-field`` and
-``--reference-field`` to evaluate another pair of fields.
+``--reference-field`` to evaluate another pair of fields. Use ``--all-fields``
+to evaluate the five configured output/reference pairs in one command.
 
-Install the optional metric dependencies before running:
+Install the supported metric dependencies before running:
 
-    pip install nltk rouge-score sacrebleu bert-score blanc
-    python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"
+    pip install nltk rouge-score sacrebleu bert-score
+    python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4'); nltk.download('punkt_tab')"
+
+BLANC is disabled by default because its PyPI package requires ``torch<2``,
+which is unavailable for Python 3.13. Use ``--include-blanc`` in a separate
+Python 3.10/3.11 environment with a compatible legacy Torch installation.
 
 Example:
 
@@ -18,6 +23,14 @@ Example:
         --generated logs/gpt6_1_sol_350.json \
         --ground-truth data/test_data/test_v2.json \
         --output-dir evaluation_results/gpt6_1_sol
+
+Evaluate all configured fields:
+
+    python code/evaluation/evaluate_text_metrics.py \
+        --generated logs/gpt6_1_sol_350.json \
+        --ground-truth data/test_data/test_v2.json \
+        --output-dir evaluation_results/gpt6_1_sol \
+        --all-fields --include-blanc --batch-size 4
 
 The output directory contains:
 
@@ -55,6 +68,14 @@ METRIC_NAMES = (
     "bertscore_recall",
     "bertscore_f1",
     "blanc",
+)
+
+FIELD_EVALUATIONS = (
+    ("legal_issue", "Legal Issue Analysis", "Simplified_Issue"),
+    ("petitioner", "Arguments of Petitioner", "Simplified_Arguments_of_Petitioner"),
+    ("respondent", "Arguments of Respondent", "Simplified_Arguments_of_Respondent"),
+    ("prediction", "Prediction", "Simplified_Decision"),
+    ("explanation", "Explanation", "Simplified_Reasoning"),
 )
 
 
@@ -262,17 +283,35 @@ def bertscore_metrics(
     ]
 
 
-def blanc_score(candidate: str, reference: str, modules: dict[str, Any]) -> float:
-    """Compute BLANC with the reference as document and candidate as summary."""
+def get_blanc_evaluator(modules: dict[str, Any]) -> Any:
+    """Create BLANC once so model loading and cache checks are not repeated."""
+    if "blanc_evaluator" in modules:
+        return modules["blanc_evaluator"]
     try:
         evaluator = modules["blanc"].BlancHelp()
-        value = evaluator.eval_once(candidate, reference)
+    except LookupError as error:
+        raise RuntimeError(
+            "NLTK tokenizer data is missing for BLANC. Run: "
+            "python -c \"import nltk; nltk.download('punkt_tab')\""
+        ) from error
     except AttributeError as error:
         raise RuntimeError(
             "The installed blanc package does not expose BlancHelp(). "
             "Install the PyPI package named 'blanc'."
         ) from error
-    return float(value)
+    modules["blanc_evaluator"] = evaluator
+    return evaluator
+
+
+def blanc_score(candidate: str, reference: str, modules: dict[str, Any]) -> float:
+    """Compute BLANC with the reference as document and candidate as summary."""
+    try:
+        return float(get_blanc_evaluator(modules).eval_once(candidate, reference))
+    except LookupError as error:
+        raise RuntimeError(
+            "NLTK tokenizer data is missing for BLANC. Run: "
+            "python -c \"import nltk; nltk.download('punkt_tab')\""
+        ) from error
 
 
 def build_reference_map(
@@ -292,9 +331,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--prediction-field", default="Explanation")
     parser.add_argument("--reference-field", default="Simplified_Reasoning")
+    parser.add_argument(
+        "--all-fields",
+        action="store_true",
+        help=(
+            "Evaluate legal issue, petitioner arguments, respondent arguments, "
+            "prediction, and explanation in one run"
+        ),
+    )
     parser.add_argument("--key-field", default="document_id")
     parser.add_argument(
-        "--no-blanc", action="store_true", help="Skip BLANC if only other metrics are needed"
+        "--include-blanc",
+        action="store_true",
+        help="Include BLANC (requires a separate Python <=3.11 environment)",
+    )
+    parser.add_argument(
+        "--no-blanc",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--batch-size",
@@ -305,17 +359,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    modules = require_metrics(args.no_blanc)
-    modules["meteor_score"] = importlib.import_module("nltk.translate.meteor_score")
+def evaluate_field(
+    args: argparse.Namespace,
+    modules: dict[str, Any],
+    prediction_field: str,
+    reference_field: str,
+    output_dir: Path,
+    include_blanc: bool,
+) -> dict[str, Any]:
     generated = [
-        (record_key(record, args.key_field), text_value(record, args.prediction_field))
+        (record_key(record, args.key_field), text_value(record, prediction_field))
         for record in iter_json_array(args.generated, array_key="results")
     ]
     wanted = {key for key, _ in generated}
     references = build_reference_map(
-        args.ground_truth, args.key_field, wanted, args.reference_field
+        args.ground_truth, args.key_field, wanted, reference_field
     )
     pairs = [
         (key, candidate, references[key])
@@ -324,9 +382,9 @@ def main() -> int:
     ]
     if not pairs:
         raise RuntimeError("No generated records matched the ground truth by the selected key")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    per_example_path = args.output_dir / "per_example.csv"
-    cumulative_path = args.output_dir / "cumulative.csv"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    per_example_path = output_dir / "per_example.csv"
+    cumulative_path = output_dir / "cumulative.csv"
     totals = {name: 0.0 for name in METRIC_NAMES}
     cumulative_rows: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -352,12 +410,12 @@ def main() -> int:
         values = lexical_metrics(candidate, reference, modules)
         values.update(bert_rows[index - 1])
         values["blanc"] = (
-            blanc_score(candidate, reference, modules) if not args.no_blanc else math.nan
+            blanc_score(candidate, reference, modules) if include_blanc else math.nan
         )
         totals = {
             name: total + values[name]
             for name, total in totals.items()
-            if not (args.no_blanc and name == "blanc")
+            if include_blanc or name != "blanc"
         } | ({"blanc": totals["blanc"]} if args.no_blanc else {})
         row: dict[str, Any] = {
             "index": index,
@@ -371,7 +429,7 @@ def main() -> int:
             **{
                 name: (
                     totals[name] / index
-                    if not (args.no_blanc and name == "blanc")
+                    if include_blanc or name != "blanc"
                     else math.nan
                 )
                 for name in METRIC_NAMES
@@ -393,19 +451,49 @@ def main() -> int:
     summary = {
         "generated": str(args.generated),
         "ground_truth": str(args.ground_truth),
-        "prediction_field": args.prediction_field,
-        "reference_field": args.reference_field,
+        "prediction_field": prediction_field,
+        "reference_field": reference_field,
         "key_field": args.key_field,
         "matched_records": len(pairs),
         "skipped_generated_records": len(generated) - len(pairs),
         "unique_generated_keys": len(wanted),
         "metrics": {name: final[name] for name in METRIC_NAMES},
-        "blanc_skipped": args.no_blanc,
+        "blanc_skipped": not include_blanc,
     }
-    (args.output_dir / "summary.json").write_text(
+    (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
+
+
+def main() -> int:
+    args = parse_args()
+    include_blanc = args.include_blanc and not args.no_blanc
+    modules = require_metrics(not include_blanc)
+    modules["meteor_score"] = importlib.import_module("nltk.translate.meteor_score")
+
+    if args.all_fields:
+        summaries = {}
+        for name, prediction_field, reference_field in FIELD_EVALUATIONS:
+            summaries[name] = evaluate_field(
+                args,
+                modules,
+                prediction_field,
+                reference_field,
+                args.output_dir / name,
+                include_blanc,
+            )
+        print(json.dumps({"evaluations": summaries}, indent=2, ensure_ascii=False))
+    else:
+        evaluate_field(
+            args,
+            modules,
+            args.prediction_field,
+            args.reference_field,
+            args.output_dir,
+            include_blanc,
+        )
     return 0
 
 

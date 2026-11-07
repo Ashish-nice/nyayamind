@@ -422,6 +422,17 @@ def load_and_process_datasets(args, tokenizer, logger):
     tokenized_datasets = load_from_disk(cache_path)
     tokenized_datasets.set_format("torch")
 
+    if "test" in tokenized_datasets and args.start_case > 1:
+        start_index = args.start_case - 1
+        start_index = min(start_index, len(tokenized_datasets["test"]))
+        tokenized_datasets["test"] = tokenized_datasets["test"].select(
+            range(start_index, len(tokenized_datasets["test"]))
+        )
+        logger.info(
+            f"Test dataset starts at case {args.start_case}; "
+            f"{len(tokenized_datasets['test'])} cases remain."
+        )
+
     # --- 5. Final Sanity Check (Rank 0 only) ---
     if local_rank == 0 and "train" in tokenized_datasets:
         sanity_check_dataset(tokenized_datasets["train"], tokenizer, logger, args)
