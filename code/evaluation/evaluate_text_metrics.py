@@ -10,19 +10,19 @@ to evaluate the five configured output/reference pairs in one command.
 
 Install the supported metric dependencies before running:
 
-    pip install nltk rouge-score sacrebleu bert-score
+    pip install nltk rouge-score sacrebleu bert-score blanc
     python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4'); nltk.download('punkt_tab')"
 
-BLANC is disabled by default because its PyPI package requires ``torch<2``,
-which is unavailable for Python 3.13. Use ``--include-blanc`` in a separate
-Python 3.10/3.11 environment with a compatible legacy Torch installation.
+BLANC requires ``torch<2``. Use a Python 3.10/3.11 environment with a
+compatible Torch installation.
 
 Example:
 
     python code/evaluation/evaluate_text_metrics.py \
         --generated logs/gpt6_1_sol_350.json \
         --ground-truth data/test_data/test_v2.json \
-        --output-dir evaluation_results/gpt6_1_sol
+        --output-dir evaluation_results/gpt6_1_sol \
+        --include-blanc
 
 Evaluate all configured fields:
 
@@ -202,6 +202,7 @@ def require_metrics(skip_blanc: bool) -> dict[str, Any]:
     """Import metric libraries with one actionable dependency error."""
     missing: list[str] = []
     modules: dict[str, Any] = {}
+    modules["torch"] = importlib.import_module("torch")
     imports = {
         "rouge_score": "rouge_score",
         "sacrebleu": "sacrebleu",
@@ -266,20 +267,69 @@ def lexical_metrics(candidate: str, reference: str, modules: dict[str, Any]) -> 
     }
 
 
+def chunk_text(text: str, tokenizer: Any, chunk_size: int) -> list[str]:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    return [
+        tokenizer.decode(token_ids[start : start + chunk_size], skip_special_tokens=True)
+        for start in range(0, len(token_ids), chunk_size)
+    ] or [""]
+
+
 def bertscore_metrics(
-    candidates: Sequence[str], references: Sequence[str], modules: dict[str, Any]
+    candidates: Sequence[str],
+    references: Sequence[str],
+    modules: dict[str, Any],
+    chunk_size: int,
+    batch_size: int,
 ) -> list[dict[str, float]]:
-    """Compute BERTScore in one batch, preserving per-example values."""
-    precision, recall, f1 = modules["bert_score"].score(
-        list(candidates), list(references), lang="en", verbose=False
+    """Score complete texts by aggregating BERTScore over bounded chunks."""
+    scorer = modules.get("bertscorer")
+    if scorer is None:
+        scorer = modules["bert_score"].BERTScorer(
+            lang="en",
+            rescale_with_baseline=False,
+            device=modules["device"],
+        )
+        modules["bertscorer"] = scorer
+
+    chunk_pairs: list[tuple[int, int, str, str]] = []
+    for index, (candidate, reference) in enumerate(zip(candidates, references)):
+        candidate_chunks = chunk_text(candidate, scorer._tokenizer, chunk_size)
+        reference_chunks = chunk_text(reference, scorer._tokenizer, chunk_size)
+        pair_count = max(len(candidate_chunks), len(reference_chunks))
+        for chunk_index in range(pair_count):
+            candidate_index = min(
+                chunk_index * len(candidate_chunks) // pair_count,
+                len(candidate_chunks) - 1,
+            )
+            reference_index = min(
+                chunk_index * len(reference_chunks) // pair_count,
+                len(reference_chunks) - 1,
+            )
+            chunk_pairs.append(
+                (index, chunk_index, candidate_chunks[candidate_index], reference_chunks[reference_index])
+            )
+
+    precision, recall, f1 = scorer.score(
+        [candidate for _, _, candidate, _ in chunk_pairs],
+        [reference for _, _, _, reference in chunk_pairs],
+        batch_size=batch_size,
+        verbose=False,
     )
+    grouped: list[list[tuple[float, float, float, int]]] = [[] for _ in candidates]
+    for (index, _, candidate, reference), p, r, score_f1 in zip(
+        chunk_pairs, precision.tolist(), recall.tolist(), f1.tolist()
+    ):
+        grouped[index].append(
+            (float(p), float(r), float(score_f1), max(len(candidate.split()), len(reference.split())))
+        )
     return [
         {
-            "bertscore_precision": float(p),
-            "bertscore_recall": float(r),
-            "bertscore_f1": float(f),
+            "bertscore_precision": sum(item[0] * item[3] for item in scores) / sum(item[3] for item in scores),
+            "bertscore_recall": sum(item[1] * item[3] for item in scores) / sum(item[3] for item in scores),
+            "bertscore_f1": sum(item[2] * item[3] for item in scores) / sum(item[3] for item in scores),
         }
-        for p, r, f in zip(precision.tolist(), recall.tolist(), f1.tolist())
+        for scores in grouped
     ]
 
 
@@ -288,7 +338,9 @@ def get_blanc_evaluator(modules: dict[str, Any]) -> Any:
     if "blanc_evaluator" in modules:
         return modules["blanc_evaluator"]
     try:
-        evaluator = modules["blanc"].BlancHelp()
+        evaluator = modules["blanc"].BlancHelp(
+            device=str(modules["device"]), show_progress_bar=False
+        )
     except LookupError as error:
         raise RuntimeError(
             "NLTK tokenizer data is missing for BLANC. Run: "
@@ -343,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--include-blanc",
         action="store_true",
-        help="Include BLANC (requires a separate Python <=3.11 environment)",
+        help="Include BLANC (enabled by default; requires torch<2)",
     )
     parser.add_argument(
         "--no-blanc",
@@ -355,6 +407,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=32,
         help="BERTScore batch size; lower this if GPU memory is limited",
+    )
+    parser.add_argument(
+        "--bertscore-chunk-tokens",
+        type=int,
+        default=400,
+        help="Tokenizer tokens per BERTScore chunk; must leave room for special tokens",
     )
     return parser.parse_args()
 
@@ -401,6 +459,8 @@ def evaluate_field(
                 candidates[offset : offset + args.batch_size],
                 references_text[offset : offset + args.batch_size],
                 modules,
+                args.bertscore_chunk_tokens,
+                args.batch_size,
             )
         )
 
@@ -457,6 +517,8 @@ def evaluate_field(
         "matched_records": len(pairs),
         "skipped_generated_records": len(generated) - len(pairs),
         "unique_generated_keys": len(wanted),
+        "torch_device": str(modules["device"]),
+        "bertscore_chunk_tokens": args.bertscore_chunk_tokens,
         "metrics": {name: final[name] for name in METRIC_NAMES},
         "blanc_skipped": not include_blanc,
     }
@@ -469,8 +531,16 @@ def evaluate_field(
 
 def main() -> int:
     args = parse_args()
-    include_blanc = args.include_blanc and not args.no_blanc
+    if args.bertscore_chunk_tokens < 1 or args.bertscore_chunk_tokens > 510:
+        raise ValueError("--bertscore-chunk-tokens must be between 1 and 510")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be positive")
+    include_blanc = not args.no_blanc
     modules = require_metrics(not include_blanc)
+    modules["device"] = modules["torch"].device(
+        "cuda" if modules["torch"].cuda.is_available() else "cpu"
+    )
+    print(f"Using torch device: {modules['device']}")
     modules["meteor_score"] = importlib.import_module("nltk.translate.meteor_score")
 
     if args.all_fields:

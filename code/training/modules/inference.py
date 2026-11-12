@@ -239,9 +239,11 @@ def _build_qwen3_prompt_text(row: dict) -> str:
     )
 
     user_content = (
-        "You are a legal expert tasked with making a judgment about whether an appeal should be accepted or rejected based on the provided case proceeding. Your task is to evaluate whether the appeal should be accepted (1) or rejected (0) based on the input.\n\n"
+        "You are a legal expert tasked with making a judgment about whether an appeal should be accepted or rejected based on the provided case proceeding, cited statutes and cited cases. Your task is to evaluate whether the appeal should be accepted (1) or rejected (0) based on the input.\n\n"
         f"### Now, evaluate the following case:\n"
         f"Case Proceedings: {row.get('Simplified_Facts', '')}\n\n"
+        f"Relevant Statutes:\n{fmt_sections.strip()}\n\n"
+        f"Cited Cases Reference:\n{fmt_citations.strip()}\n\n"
         "Provide your judgment by strictly following this format:\n"
         "##PREDICTION: [Insert your prediction here]\n"
         "##EXPLANATION: [Insert your reasoning here that led you to your prediction.]\n"
