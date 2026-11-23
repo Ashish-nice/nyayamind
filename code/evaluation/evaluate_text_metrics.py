@@ -39,6 +39,12 @@ The output directory contains:
   plots.
 * ``summary.json``: final means, counts, and configuration.
 
+Records with a blank generated or reference field are skipped for that field
+and are reported in ``summary.json``.
+
+For binary ``Prediction`` fields, decision prose is normalized to its final
+accepted/rejected label before metrics are computed.
+
 BLANC is a summary-helpfulness metric rather than a direct similarity metric.
 It is reported with the ground truth as the source document and the generated
 text as the summary.
@@ -191,7 +197,37 @@ def text_value(record: dict[str, Any], field: str) -> str:
     value = record.get(field, "")
     if isinstance(value, (dict, list, tuple)):
         return json.dumps(value, ensure_ascii=False)
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
+
+
+DECISION_LABEL_PATTERN = re.compile(
+    r"\b("
+    r"not\s+(?:succeed|succeeding|accepted?|allowed?|granted?)|"
+    r"accept(?:ed)?|allow(?:ed)?|grant(?:ed)?|succeed(?:s|ed)?|"
+    r"set\s+aside|quash(?:ed)?|"
+    r"reject(?:ed)?|dismiss(?:ed|al)?|disallow(?:ed)?|"
+    r"den(?:y|ied)|fail(?:s|ed)?|uphold(?:s|ed)?|confirm(?:s|ed)?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def decision_label(text: str) -> str:
+    """Normalize a binary prediction or decision prose to ``0`` or ``1``."""
+    normalized = text.strip().lower()
+    if normalized in {"0", "1"}:
+        return normalized
+    matches = list(DECISION_LABEL_PATTERN.finditer(normalized))
+    if not matches:
+        return ""
+    phrase = matches[-1].group(1)
+    if phrase.startswith("not "):
+        return "0"
+    return (
+        "1"
+        if phrase.startswith(("accept", "allow", "grant", "succeed", "set aside", "quash"))
+        else "0"
+    )
 
 
 def tokens(text: str) -> list[str]:
@@ -433,13 +469,27 @@ def evaluate_field(
     references = build_reference_map(
         args.ground_truth, args.key_field, wanted, reference_field
     )
-    pairs = [
+    matched_pairs = [
         (key, candidate, references[key])
         for key, candidate in generated
         if key in references
     ]
+    raw_matched_pairs = matched_pairs
+    if prediction_field in {"Prediction", "predicted_decision"}:
+        matched_pairs = [
+            (key, decision_label(candidate), decision_label(reference))
+            for key, candidate, reference in matched_pairs
+        ]
+    pairs = [
+        (key, candidate, reference)
+        for key, candidate, reference in matched_pairs
+        if candidate and reference
+    ]
     if not pairs:
-        raise RuntimeError("No generated records matched the ground truth by the selected key")
+        raise RuntimeError(
+            "No non-blank generated/reference records matched the ground truth "
+            "by the selected key"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     per_example_path = output_dir / "per_example.csv"
     cumulative_path = output_dir / "cumulative.csv"
@@ -515,13 +565,34 @@ def evaluate_field(
         "reference_field": reference_field,
         "key_field": args.key_field,
         "matched_records": len(pairs),
-        "skipped_generated_records": len(generated) - len(pairs),
+        "skipped_blank_records": sum(
+            not candidate or not reference
+            for _, candidate, reference in raw_matched_pairs
+        ),
+        "skipped_unclassifiable_records": sum(
+            bool(
+                candidate
+                and reference
+                and (not normalized_candidate or not normalized_reference)
+            )
+            for (_, candidate, reference), (
+                _,
+                normalized_candidate,
+                normalized_reference,
+            ) in zip(raw_matched_pairs, matched_pairs)
+        ),
+        "skipped_generated_records": len(generated) - len(raw_matched_pairs),
         "unique_generated_keys": len(wanted),
         "torch_device": str(modules["device"]),
         "bertscore_chunk_tokens": args.bertscore_chunk_tokens,
         "metrics": {name: final[name] for name in METRIC_NAMES},
         "blanc_skipped": not include_blanc,
     }
+    if prediction_field in {"Prediction", "predicted_decision"}:
+        summary["prediction_normalized_to_label"] = True
+        summary["decision_accuracy"] = sum(
+            candidate == reference for _, candidate, reference in pairs
+        ) / len(pairs)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )

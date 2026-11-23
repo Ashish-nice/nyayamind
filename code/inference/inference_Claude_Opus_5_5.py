@@ -36,6 +36,8 @@ DEFAULT_FREQUENCY_PENALTY = 0.0
 DEFAULT_PRESENCE_PENALTY = 0.0
 DEFAULT_REPETITION_PENALTY = 1.1
 DEFAULT_MAX_RETRIES = 5
+MAX_PROMPT_TOKENS = 17000
+CHARS_PER_ESTIMATED_TOKEN = 4
 
 
 def load_dotenv(path: Path) -> None:
@@ -54,11 +56,10 @@ def load_dotenv(path: Path) -> None:
 
 
 def build_prompt(row: dict[str, Any]) -> str:
-    """Build the Claude Opus 5.5 prompt using the local evaluator format."""
+    """Build a concise Claude prompt that requests only model-generated fields."""
     sec_titles = row.get("section_titles", []) or []
     sec_texts = row.get("section_texts", []) or []
     case_titles = row.get("cited_cases", []) or []
-    case_judgments = row.get("cited_case_judgments", []) or []
 
     fmt_sections = (
         "".join(
@@ -71,49 +72,20 @@ def build_prompt(row: dict[str, Any]) -> str:
         else "No specific statutes provided."
     )
     fmt_citations = (
-        "".join(
-            f"Precedent {index}. {case}:\n"
-            f"   {judgment or 'Details not available.'}\n\n"
-            for index, (case, judgment) in enumerate(
-                zip(case_titles, case_judgments), 1
-            )
-        )
+        ", ".join(str(case) for case in case_titles)
         if case_titles
-        else "No citations provided."
+        else "None"
     )
 
-    system_msg = (
-        "You are a smart and intelligent legal assistant for the Indian legal "
-        "domain. Based on the user's instructions, assist with tasks related to "
-        "the Indian legal system. Since these tasks have legal application, only "
-        "provide responses you are extremely certain about, and avoid ambiguity "
-        "or uncertainty. Ensure that your output follows the requirements.\n"
-    )
     return (
-        "SYSTEM:\n"
-        + system_msg
-        + "\nUSER:\n\n"
-        "You are a legal expert tasked with making a judgment about whether an "
-        "appeal should be accepted or rejected based on the provided case "
-        "proceeding, cited statutes and cited cases. Your task is to evaluate "
-        "whether the appeal should be accepted (1) or rejected (0) based on the "
-        "input. Use exactly 1 for accepted and 0 for rejected.\n\n"
-        "### Now, evaluate the following case:\n"
-        f"Case Proceedings: {row.get('Simplified_Facts', '')}\n\n"
-        f"Relevant Statutes:\n{fmt_sections.strip()}\n\n"
-        f"Cited Cases Reference:\n{fmt_citations.strip()}\n\n"
-        "Return exactly this format, with every section populated using the "
-        "provided case and legal materials:\n"
-        "<think>\n"
-        "**Legal Issue Analysis:**\n[issue and governing legal question]\n\n"
-        "**Arguments of Petitioner:**\n[petitioner's facts and legal arguments]\n\n"
-        "**Arguments of Respondent:**\n[respondent's facts and legal arguments]\n\n"
-        "**Deliberation:**\n[application of statutes and precedents to the facts]\n"
-        "</think>\n"
-        "##PREDICTION: [Insert 0 or 1]\n"
-        "##EXPLANATION: [Concise legal reasoning supporting the prediction]\n"
-        "Do not leave any section empty, do not use placeholders, and do not "
-        "include text outside this format."
+        "You are evaluating an Indian legal appeal.\n"
+        "Return a prediction of 1 if the appeal is accepted or 0 if it is rejected.\n"
+        "Return exactly one valid JSON object with no markdown. Use this schema:\n"
+        '{"legal_issue":"","petitioner_arguments":"","respondent_arguments":""'
+        ',"deliberation":"","prediction":0,"explanation":""}\n\n'
+        f"Case proceedings:\n{row.get('Simplified_Facts', '')}\n\n"
+        f"Relevant statutes:\n{fmt_sections.strip()}\n\n"
+        f"Cited precedents:\n{fmt_citations}\n"
     )
 
 
@@ -128,29 +100,78 @@ def trim_prompt(prompt: str, max_input_tokens: int) -> str:
     return prompt[:max_chars].rstrip() + "\n\n[Case text truncated.]"
 
 
+def estimate_prompt_tokens(prompt: str) -> int:
+    """Estimate token count conservatively with the evaluator's character ratio."""
+    return (len(prompt) + CHARS_PER_ESTIMATED_TOKEN - 1) // CHARS_PER_ESTIMATED_TOKEN
+
+
 def parse_prediction(text: str, reasoning: str = "") -> int | None:
-    match = re.search(r"##\s*PREDICTION\s*:\s*([01])\b", text, re.IGNORECASE)
-    if not match:
-        match = re.fullmatch(r"\s*([01])\s*", text or "")
-    if match:
+    combined = f"{text}\n{reasoning}".lower()
+
+    json_match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    if json_match:
+        try:
+            payload = json.loads(json_match.group(0))
+            value = payload.get("prediction")
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, (int, float)) and value in (0, 1):
+                return int(value)
+            if isinstance(value, str) and value.strip() in {"0", "1"}:
+                return int(value.strip())
+        except json.JSONDecodeError:
+            pass
+
+    marker_patterns = (
+        r"##\s*PREDICTION\s*:\s*(?:\*\*|`)?\s*([01])\b",
+        r"(?:\*\*|__)?\s*PREDICTION\s*(?:\*\*|__)?\s*:\s*(?:\*\*|`)?\s*([01])\b",
+        r"(?:\*\*|__)?\s*(?:PREDICTED\s+DECISION|DECISION|VERDICT|ANSWER)\s*(?:\*\*|__)?\s*:\s*(?:\*\*|`)?\s*([01])\b",
+        r"\b(?:prediction|decision|answer|verdict)\b\s*(?:is|=|:)\s*(?:\*\*|`)?\s*([01])\b",
+        r"[\"'](?:prediction|decision|predicted_decision)[\"']\s*:\s*(?:[\"'])?([01])\b",
+        r"<(?:prediction|decision|predicted_decision)>\s*([01])\s*</(?:prediction|decision|predicted_decision)>",
+        r"\b(?:choose|return|use|final(?:\s+answer)?|label)\s+(?:is\s+)?(?:\*\*|`)?([01])\b",
+    )
+    for pattern in marker_patterns:
+        match = re.search(pattern, combined, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+
+    if re.fullmatch(r"\s*(?:\*\*|`)?([01])(?:\*\*|`)?\s*", combined):
+        match = re.fullmatch(
+            r"\s*(?:\*\*|`)?([01])(?:\*\*|`)?\s*", combined
+        )
         return int(match.group(1))
 
-    combined = f"{text}\n{reasoning}".lower()
-    decisions = list(
-        re.finditer(
-            r"\b(accepted|rejected|accept|reject|dismissed|dismiss|zero|one)\b",
-            combined,
-        )
-    )
+    decisions = list(re.finditer(
+        r"\b(accepted|rejected|allowed|disallowed|upheld|dismissed|"
+        r"allow|reject|accept|dismiss|grant|deny|zero|one)\b",
+        combined,
+    ))
     if not decisions:
         return None
     label = decisions[-1].group(1)
-    return 1 if label in {"accepted", "accept", "one"} else 0
+    return 1 if label in {
+        "accepted", "allowed", "upheld", "accept", "allow", "grant", "one"
+    } else 0
 
 
 def parse_response(text: str, reasoning: str = "") -> dict[str, Any]:
     """Extract the structured prediction and explanation from model output."""
     prediction = parse_prediction(text, reasoning)
+    json_payload: dict[str, Any] = {}
+    json_match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    if json_match:
+        try:
+            parsed_payload = json.loads(json_match.group(0))
+            if isinstance(parsed_payload, dict):
+                json_payload = parsed_payload
+        except json.JSONDecodeError:
+            pass
+    json_explanation = json_payload.get("explanation")
+    if isinstance(json_explanation, str) and json_explanation.strip():
+        explanation = json_explanation.strip()
+    else:
+        explanation = ""
     explanation_match = re.search(
         r"##\s*EXPLANATION\s*:\s*(.*?)(?=\n##\s*\w+\s*:|$)",
         text or "",
@@ -160,11 +181,12 @@ def parse_response(text: str, reasoning: str = "") -> dict[str, Any]:
         r"<think>\s*(.*?)\s*</think>", text or "", re.IGNORECASE | re.DOTALL
     )
     visible_reasoning = think_match.group(1).strip() if think_match else ""
-    explanation = (
-        explanation_match.group(1).strip()
-        if explanation_match
-        else (visible_reasoning or reasoning or "").strip()
-    )
+    if not json_explanation:
+        explanation = (
+            explanation_match.group(1).strip()
+            if explanation_match
+            else (visible_reasoning or reasoning or "").strip()
+        )
     return {
         "prediction": prediction,
         "reasoning": explanation,
@@ -192,31 +214,6 @@ def parse_think_sections(reasoning: str) -> dict[str, str]:
         )
         sections[name] = match.group(1).strip() if match else ""
     return sections
-
-
-def is_tag_only_output(text: str) -> bool:
-    """Detect the empty wrapper that some providers return on failure."""
-    return not text.strip() or bool(
-        re.fullmatch(
-            r"\s*(?:<think>\s*</think>\s*)?"
-            r"(?:##\s*PREDICTION\s*:\s*[01]?\s*)?"
-            r"(?:##\s*EXPLANATION\s*:\s*)?",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
-def fallback_prediction(row: dict[str, Any]) -> int | None:
-    value = " ".join(
-        str(row.get(key, "")).strip().lower()
-        for key in ("Simplified_Decision", "Decision")
-    )
-    if re.search(r"\b(0|reject(?:ed)?|dismiss(?:ed)?|disallow(?:ed)?|denied?)\b", value):
-        return 0
-    if re.search(r"\b(1|accept(?:ed)?|allow(?:ed)?|grant(?:ed)?)\b", value):
-        return 1
-    return None
 
 
 def extract_content(message: dict[str, Any]) -> str:
@@ -442,13 +439,29 @@ def main() -> int:
         raise ValueError("--sample-size must be non-negative.")
     sample_count = min(args.sample_size, len(rows))
     selected_rows = random.Random(args.sample_seed).sample(rows, sample_count)
-    prompts = [
-        trim_prompt(build_prompt(row), args.max_seq_length - args.max_new_tokens)
-        for row in selected_rows
-    ]
+    prompt_pairs = []
+    skipped_long_prompts = 0
+    for row in selected_rows:
+        prompt = build_prompt(row)
+        estimated_tokens = estimate_prompt_tokens(prompt)
+        if estimated_tokens > MAX_PROMPT_TOKENS:
+            skipped_long_prompts += 1
+            continue
+        prompt_pairs.append(
+            (
+                row,
+                trim_prompt(
+                    prompt,
+                    args.max_seq_length - args.max_new_tokens,
+                ),
+            )
+        )
+    evaluated_rows = [row for row, _ in prompt_pairs]
     print(
-        f"Loaded {len(rows)} rows; randomly evaluating {len(selected_rows)} "
-        f"rows (sample_seed={args.sample_seed}). "
+        f"Loaded {len(rows)} rows; randomly selected {len(selected_rows)}; "
+        f"skipped {skipped_long_prompts} prompts above {MAX_PROMPT_TOKENS} "
+        f"estimated tokens; evaluating {len(evaluated_rows)} "
+        f"(sample_seed={args.sample_seed}). "
         f"Settings: max_new_tokens={args.max_new_tokens}, "
         f"max_seq_length={args.max_seq_length}, "
         f"temperature={args.temperature}, "
@@ -459,7 +472,10 @@ def main() -> int:
         f"seed={args.seed}"
     )
     if args.dry_run:
-        print(f"Dry run successful. First prompt length: {len(prompts[0]) if prompts else 0} characters.")
+        print(
+            f"Dry run successful. {len(evaluated_rows)} prompts eligible; "
+            f"{skipped_long_prompts} prompts skipped."
+        )
         return 0
 
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -475,62 +491,66 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
-    for offset, (row, prompt) in enumerate(zip(selected_rows, prompts)):
+    for offset, (row, prompt) in enumerate(prompt_pairs):
         try:
-                response = request_completion(
-                    api_key,
-                    prompt,
-                    args.timeout,
-                    args.max_retries,
-                    args.max_new_tokens,
-                    args.temperature,
-                    args.frequency_penalty,
-                    args.presence_penalty,
-                    args.repetition_penalty,
-                    args.seed,
-                )
+                response = None
+                text = ""
+                reasoning = ""
+                finish_reason = ""
+                for empty_output_attempt in range(args.max_retries + 1):
+                    response = request_completion(
+                        api_key,
+                        prompt,
+                        args.timeout,
+                        args.max_retries,
+                        args.max_new_tokens,
+                        args.temperature,
+                        args.frequency_penalty,
+                        args.presence_penalty,
+                        args.repetition_penalty,
+                        args.seed,
+                    )
+                    choice = response["choices"][0]
+                    message = choice["message"]
+                    text = extract_content(message)
+                    reasoning = extract_reasoning(choice)
+                    finish_reason = str(choice.get("finish_reason") or "")
+                    if text or reasoning or finish_reason == "content_filter":
+                        break
+                    if empty_output_attempt < args.max_retries:
+                        time.sleep(min(60, 2**empty_output_attempt))
                 choice = response["choices"][0]
                 message = choice["message"]
-                text = extract_content(message)
-                reasoning = extract_reasoning(choice)
                 raw_output = "\n".join(
                     part for part in (text, reasoning) if part
                 ).strip()
                 parsed_response = parse_response(text, reasoning)
                 sections = parse_think_sections(raw_output)
-                sections["Legal Issue Analysis"] = (
-                    sections["Legal Issue Analysis"]
-                    or str(row.get("Simplified_Issue", "")).strip()
-                )
-                sections["Arguments of Petitioner"] = (
-                    sections["Arguments of Petitioner"]
-                    or str(row.get("Simplified_Arguments_of_Petitioner", "")).strip()
-                )
-                sections["Arguments of Respondent"] = (
-                    sections["Arguments of Respondent"]
-                    or str(row.get("Simplified_Arguments_of_Respondent", "")).strip()
-                )
-                prediction = (
-                    parsed_response["prediction"]
-                    if parsed_response["prediction"] in (0, 1)
-                    else fallback_prediction(row)
-                )
+                json_match = re.search(r"\{.*\}", text or "", re.DOTALL)
+                if json_match:
+                    try:
+                        json_payload = json.loads(json_match.group(0))
+                        if isinstance(json_payload, dict):
+                            sections["Legal Issue Analysis"] = str(
+                                json_payload.get("legal_issue", "") or ""
+                            ).strip()
+                            sections["Arguments of Petitioner"] = str(
+                                json_payload.get("petitioner_arguments", "") or ""
+                            ).strip()
+                            sections["Arguments of Respondent"] = str(
+                                json_payload.get("respondent_arguments", "") or ""
+                            ).strip()
+                            sections["Deliberation"] = str(
+                                json_payload.get("deliberation", "") or ""
+                            ).strip()
+                    except json.JSONDecodeError:
+                        pass
+                prediction = parsed_response["prediction"]
                 explanation = (
                     parsed_response["reasoning"]
                     if parsed_response["reasoning"]
-                    else str(row.get("Simplified_Reasoning", "")).strip()
+                    else ""
                 )
-                if is_tag_only_output(raw_output):
-                    raw_output = (
-                        f"<think>\n"
-                        f"**Legal Issue Analysis:**\n{sections['Legal Issue Analysis']}\n\n"
-                        f"**Arguments of Petitioner:**\n{sections['Arguments of Petitioner']}\n\n"
-                        f"**Arguments of Respondent:**\n{sections['Arguments of Respondent']}\n\n"
-                        f"**Deliberation:**\n{explanation}\n"
-                        f"</think>\n"
-                        f"##PREDICTION: {prediction}\n"
-                        f"##EXPLANATION: {explanation}"
-                    )
                 record = {
                     **row,
                     "Legal Issue Analysis": sections["Legal Issue Analysis"],
@@ -539,6 +559,13 @@ def main() -> int:
                     "Prediction": prediction,
                     "Explanation": explanation,
                     "predicted_decision": prediction,
+                    "raw_output": raw_output,
+                    "finish_reason": finish_reason,
+                    "empty_output": not bool(raw_output),
+                    "error": (
+                        "OpenRouter blocked the prompt with finish_reason=content_filter"
+                        if finish_reason == "content_filter" else ""
+                    ),
                 }
         except RuntimeError as exc:
             record = {
@@ -549,6 +576,7 @@ def main() -> int:
                 "Prediction": None,
                 "Explanation": "",
                 "predicted_decision": None,
+                "raw_output": "",
                 "error": str(exc),
             }
             print(f"[{offset}] ERROR: {exc}", file=sys.stderr)
@@ -557,11 +585,17 @@ def main() -> int:
             "run_name": "nyayamind",
             "model_path": MODEL,
             "label": "sample",
-            "n_samples": len(selected_rows),
+            "n_samples": len(evaluated_rows),
+            "selected_samples": len(selected_rows),
+            "skipped_long_prompts": skipped_long_prompts,
+            "max_prompt_tokens": MAX_PROMPT_TOKENS,
+            "gold_fallback_disabled": True,
             "output_format": (
                 "Each result contains all original dataset fields plus "
-                "Prediction, Explanation, and predicted_decision. "
-                "No model-output field is stored."
+                "model-generated Prediction, Explanation, and structured "
+                "section fields. Missing model outputs remain blank or None; "
+                "ground-truth fields are never used as fallbacks. raw_output "
+                "contains the provider's model text for diagnostics."
             ),
             "results": records,
         }
@@ -570,7 +604,7 @@ def main() -> int:
             encoding="utf-8",
         )
         print(
-            f"[{offset + 1}/{len(selected_rows)}] "
+            f"[{offset + 1}/{len(prompt_pairs)}] "
             f"prediction={record.get('Prediction')}"
         )
 
