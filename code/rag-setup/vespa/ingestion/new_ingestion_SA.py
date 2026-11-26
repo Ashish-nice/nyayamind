@@ -1,118 +1,74 @@
-import pandas as pd
-import numpy as np
-import os
-import unicodedata
-import json
-from tqdm import tqdm
-from sentence_transformers import SentenceTransformer
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from transformers import AutoTokenizer
-from vespa.application import Vespa
-import torch
+"""Ingest State Acts (data/SA/<State>.csv) into one `sa_<state>` schema per state.
 
-# --- Configuration ---
-VESPA_URL = "http://localhost:8085"
-# This list matches the keys/filenames used in your setup script
-STATE_LIST = ["Lakshadweep", "Madhya Pradesh", "Tamil Nadu", "Chandigarh", "Bihar",
-    "Uttarakhand", "Rajasthan", "Jharkhand", "Jammu and Kashmir", "Odisha",
-    "Puducherry", "Punjab", "Andhra Pradesh", "West Bengal", "Tripura",
-    "Ladakh", "Chhattisgarh", "Maharashtra", "Telangana", "Himachal Pradesh",
-    "Gujarat", "Manipur", "Karnataka", "Arunachal Pradesh",
-    "Andaman and Nicobar Islands", "Assam", "Delhi", "Goa", "Meghalaya",
-    "Dadra and Nagar Haveli and Daman and Diu", "Kerala", "Haryana",
-    "Uttar Pradesh"]
-# Example full list:
-# STATE_LIST = ['Lakshadweep', 'Madhya Pradesh', 'Tamil Nadu', ... ]
+Stages (see common.py):
+    --stage embed   chunk (8192 tokens, 200 overlap) + embed -> data/vespa_feed/sa_<state>/
+    --stage feed    push the pre-computed shards into Vespa
+    --stage all     both (default)
 
-# 1. Load Model
-MODEL_NAME = "Snowflake/snowflake-arctic-embed-m-v2.0"
-print(f"Loading model: {MODEL_NAME}...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = SentenceTransformer(MODEL_NAME, device=device, trust_remote_code=True)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    --states "Goa" "Kerala"   restrict to some states (default: every CSV in data/SA)
+"""
 
-# 2. Connect to Vespa
-app = Vespa(url=VESPA_URL)
+from __future__ import annotations
 
-def preprocess_text(text):
-    if pd.isna(text):
-        return ""
-    text = text.replace("\n", " ")
-    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
-    text = ' '.join(text.split())
-    return text
+import argparse
+import sys
+from pathlib import Path
 
-def get_token_length(text):
-    tokens = tokenizer(text, return_attention_mask=False, return_token_type_ids=False)
-    return len(tokens['input_ids'])
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import common as c  # noqa: E402
 
-# 3. Setup Text Splitter
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=8192,
-    chunk_overlap=200,
-    separators=["\n\n", "\n", ". ", " "],
-    length_function=get_token_length
-)
 
-def ingest_data():
-    for state_name in STATE_LIST:
-        # Construct filepath based on the list item
-        file_path = f'/home/shubham/tanmay/lexensemble/code/state_acts_csv/{state_name}.csv'
+def make_docs_for(state_name: str, schema_name: str):
+    def make_docs(row_index: int, row: dict[str, str], tokenizer):
+        section_text = c.preprocess_text(row.get("Section Text"), lower=False)
+        if not section_text:
+            return []
+        # State CSVs use underscores in statute names ("The_Goa_..._Act,_2005").
+        statute = c.preprocess_text(str(row.get("Name of Statute") or "").replace("_", " "), lower=False)
+        number = c.preprocess_text(row.get("Section Number"), lower=False)
+        title = c.preprocess_text(row.get("Section Title"), lower=False)
+        raw_id = str(row.get("id") or "").strip()
+        original_id = int(raw_id) if raw_id.isdigit() else row_index
+        header = f"{statute} ({state_name}) | Section {number.rstrip('.')}. {title}"
+        docs = []
+        for chunk_index, chunk in enumerate(c.chunk_by_tokens(section_text, tokenizer, overlap=200)):
+            doc_id = f"{schema_name}_{original_id}_{chunk_index}"
+            fields = {
+                "id": doc_id,
+                "original_doc_id": original_id,
+                "state_name": c.preprocess_text(row.get("State Name") or state_name, lower=False),
+                "name_of_statute": statute,
+                "section_number": number,
+                "section_title": title,
+                "section_text": chunk,
+            }
+            docs.append((doc_id, fields, f"{header} | {chunk}"))
+        return docs
 
-        if not os.path.exists(file_path):
-            print(f"⚠️ Skipping `{state_name}` — CSV not found at {file_path}")
+    return make_docs
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    c.add_stage_args(parser)
+    parser.add_argument("--states", nargs="*", default=None)
+    args = parser.parse_args()
+    states = args.states or c.available_states()
+    for state_name in states:
+        if not c.state_csv(state_name).exists():
+            print(f"Skipping {state_name}: no CSV at {c.state_csv(state_name)}")
             continue
+        schema_name = c.state_schema(state_name)
+        if args.stage in ("embed", "all"):
+            c.run_embedding_stage(
+                schema_name,
+                enumerate(c.iter_csv(c.state_csv(state_name))),
+                make_docs_for(state_name, schema_name),
+                limit=args.limit,
+            )
+        if args.stage in ("feed", "all"):
+            c.run_feed_stage(schema_name, follow=args.follow)
 
-        print(f"\n🔍 Processing state: {state_name}")
-        df = pd.read_csv(file_path)
-
-        # --- KEY CHANGE: Dynamic Schema Name ---
-        # Matches new_setup_merged.py logic: "sa_" + lowercase + underscores
-        clean_name = state_name.lower().replace(" ", "_")
-        schema_name = f"sa_{clean_name}"
-
-        vespa_feed = []
-        global_id_counter = 0
-
-        for i, row in tqdm(df.iterrows(), total=len(df), desc=f"Ingesting into {schema_name}"):
-            original_text = row.get('Section Text', '')
-            if pd.isna(original_text): continue
-
-            chunks = text_splitter.split_text(str(original_text))
-
-            for chunk in chunks:
-                clean_chunk = preprocess_text(chunk)
-                embedding = model.encode(clean_chunk).tolist()
-
-                # Unique Doc ID
-                doc_id = f"{schema_name}_{row.get('id', i)}_{global_id_counter}"
-
-                vespa_fields = {
-                    "id": doc_id,
-                    "original_doc_id": int(row.get("id", 0)) if pd.notna(row.get("id")) else 0,
-                    "state_name": str(row.get("State Name", state_name)),
-                    "name_of_statute": str(row.get("Name of Statute", "")),
-                    "section_number": str(row.get("Section Number", "")),
-                    "section_title": str(row.get("Section Title", "")),
-                    "section_text": clean_chunk,
-                    "embedding": embedding
-                }
-
-                vespa_feed.append({
-                    "id": doc_id,
-                    "fields": vespa_fields
-                })
-                global_id_counter += 1
-
-                # Feed in batches
-                if len(vespa_feed) >= 100:
-                    app.feed_iterable(iter(vespa_feed), schema=schema_name)
-                    vespa_feed = []
-
-        # Flush remaining
-        if vespa_feed:
-            app.feed_iterable(iter(vespa_feed), schema=schema_name)
-        print(f"✅ Completed {state_name}")
 
 if __name__ == "__main__":
-    ingest_data()
+    main()

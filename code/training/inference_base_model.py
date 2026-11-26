@@ -103,6 +103,8 @@ def _get_args():
                    help="Directory where output JSON files are written")
     p.add_argument("--dataset_dir", type=str, default="./dataset",
                    help="Directory containing test_v2.json")
+    p.add_argument("--test_file", type=str, default="test_v2.json",
+                   help="Test file inside dataset_dir; use test_v2_rag.json for retrieved context")
     p.add_argument("--start_case", type=int, default=1,
                    help="1-based case number to start evaluating from")
     p.add_argument("--eval_batch_size", type=int, default=1,
@@ -351,7 +353,7 @@ def run_base_eval(args, logger):
     FastLanguageModel.for_inference(model)
 
     # Load full test set
-    all_rows = list(_load_raw_test(args.dataset_dir))
+    all_rows = list(_load_raw_test(args.dataset_dir, args.test_file))
     all_rows = all_rows[args.start_case - 1:]
     n_total  = len(all_rows)
     logger.info(f"Full test size  : {n_total} rows (starting at case {args.start_case})")

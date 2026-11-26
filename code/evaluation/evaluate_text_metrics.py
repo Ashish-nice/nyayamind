@@ -429,6 +429,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--key-field", default="document_id")
     parser.add_argument(
+        "--limit", type=int, default=None, help="Evaluate only the first N generated records"
+    )
+    parser.add_argument(
         "--include-blanc",
         action="store_true",
         help="Include BLANC (enabled by default; requires torch<2)",
@@ -465,6 +468,8 @@ def evaluate_field(
         (record_key(record, args.key_field), text_value(record, prediction_field))
         for record in iter_json_array(args.generated, array_key="results")
     ]
+    if args.limit is not None:
+        generated = generated[: args.limit]
     wanted = {key for key, _ in generated}
     references = build_reference_map(
         args.ground_truth, args.key_field, wanted, reference_field

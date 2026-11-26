@@ -1,233 +1,70 @@
-# import sys
-# from sentence_transformers import SentenceTransformer
-# from vespa.application import Vespa
-# import torch
+"""Hybrid (dense + BM25, RRF) search over Central Acts (`centralacts`).
 
-# # --- Configuration ---
-# VESPA_URL = "http://localhost:8085"
-# # Using the same model as defined in your setup/previous context
-# MODEL_NAME = "Snowflake/snowflake-arctic-embed-m-v2.0"
-# RRF_K = 60
+Endpoint for other code:
+    from query_CA import search_central_acts
+    search_central_acts("bail in non-bailable offence", top_k=5)
 
-# # Initialize
-# app = Vespa(url=VESPA_URL)
-# print("Loading model for query encoding...")
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# model = SentenceTransformer(MODEL_NAME, device=device, trust_remote_code=True)
+Interactive use:
+    python code/rag-setup/vespa/retrieval/query_CA.py
+"""
 
-# def reciprocal_rank_fusion(vector_results, bm25_results, k=60):
-#     """
-#     Computes RRF score to combine Vector and BM25 lists.
-#     """
-#     scores = {}
+from __future__ import annotations
 
-#     # Process Vector Results
-#     for rank, hit in enumerate(vector_results):
-#         doc_id = hit['id']
-#         scores[doc_id] = scores.get(doc_id, 0) + (1 / (k + rank + 1))
-
-#     # Process BM25 Results
-#     for rank, hit in enumerate(bm25_results):
-#         doc_id = hit['id']
-#         scores[doc_id] = scores.get(doc_id, 0) + (1 / (k + rank + 1))
-
-#     # Sort by score descending
-#     return sorted(scores.items(), key=lambda item: item[1], reverse=True)
-
-# def search_central_acts(query_text):
-#     print(f"\nSearching Central Acts for: '{query_text}'")
-
-#     query_emb = model.encode(query_text).tolist()
-
-#     # 1. Vector Search (Central Acts Only)
-#     # Uses ranking profile 'vector_only' defined in your ca_schema
-#     vector_response = app.query(body={
-#         "yql": "select * from sources centralacts where ({targetHits:10}nearestNeighbor(embedding,q_emb));",
-#         "ranking": "semantic",
-#         # FIX: "input.query(q_emb)" must be at the top level, not nested in "inputs"
-#         "input.query(q_emb)": query_emb,
-#         "hits": 10
-#     })
-#     vector_hits = vector_response.hits
-#     print(f"   Found {len(vector_hits)} vector matches")
-
-#     # 2. BM25 Search (Central Acts Only)
-#     # Uses ranking profile 'bm25_only' defined in your ca_schema
-#     bm25_response = app.query(body={
-#         "yql": "select * from sources centralacts where userQuery();",
-#         "query": query_text,
-#         "type": "all",
-#         "ranking": "bm25",
-#         "hits": 10
-#     })
-#     bm25_hits = bm25_response.hits
-#     print(f"   Found {len(bm25_hits)} BM25 matches")
-
-#     # 3. RRF Re-ranking
-#     reranked_ids = reciprocal_rank_fusion(vector_hits, bm25_hits, k=RRF_K)
-#     top_5_ids = [doc_id for doc_id, score in reranked_ids[:5]]
-
-#     print("\n--- Top 5 Central Acts Results ---")
-
-#     # Create a lookup map for printing
-#     all_hits_map = {h['id']: h for h in vector_hits + bm25_hits}
-
-#     for rank, doc_id in enumerate(top_5_ids):
-#         doc = all_hits_map.get(doc_id)
-#         if doc:
-#             fields = doc['fields']
-
-#             # Extract fields specific to Central Acts schema
-#             act_name = fields.get('name_of_statute', 'Unknown Act')
-#             sec_num = fields.get('section_number', '?')
-#             sec_title = fields.get('section_title', 'Untitled')
-#             text = fields.get('section_text', '')
-
-#             print(f"{rank+1}. [{doc_id}] {act_name} - Section {sec_num}")
-#             print(f"   Title: {sec_title}")
-#             print(f"   Snippet: {text[:200]}...\n")
-
-# if __name__ == "__main__":
-#     try:
-#         while True:
-#             user_query = input("Enter search query (or 'exit'): ")
-#             if user_query.lower() == 'exit':
-#                 break
-#             search_central_acts(user_query)
-#     except KeyboardInterrupt:
-#         print("\nExiting...")
-
-
-import sys
 import csv
 import os
-from sentence_transformers import SentenceTransformer
-from vespa.application import Vespa
-import torch
+import sys
+from pathlib import Path
 
-# --- Configuration ---
-VESPA_URL = "http://localhost:8085"
-MODEL_NAME = "Snowflake/snowflake-arctic-embed-m-v2.0"
-RRF_K = 60
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import common as c  # noqa: E402
+
 CSV_FILENAME = "ca_search_results.csv"
 
-# Initialize
-app = Vespa(url=VESPA_URL)
-print("Loading model for query encoding...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = SentenceTransformer(MODEL_NAME, device=device, trust_remote_code=True)
 
-def reciprocal_rank_fusion(vector_results, bm25_results, k=60):
-    """
-    Computes RRF score to combine Vector and BM25 lists.
-    """
-    scores = {}
+def search_central_acts(query_text: str, top_k: int = 5, query_embedding=None, app=None) -> list[dict]:
+    return c.search_collection(
+        [c.CA_SCHEMA],
+        query_text,
+        top_k=top_k,
+        query_embedding=query_embedding,
+        dedupe_fields=("name_of_statute", "section_number"),
+        app=app,
+    )
 
-    # Process Vector Results
-    for rank, hit in enumerate(vector_results):
-        doc_id = hit['id']
-        scores[doc_id] = scores.get(doc_id, 0) + (1 / (k + rank + 1))
 
-    # Process BM25 Results
-    for rank, hit in enumerate(bm25_results):
-        doc_id = hit['id']
-        scores[doc_id] = scores.get(doc_id, 0) + (1 / (k + rank + 1))
+def save_to_csv(query: str, results: list[dict]) -> None:
+    fieldnames = ["Query", "Rank", "Act Name", "Section Number", "Section Title", "Snippet"]
+    exists = os.path.isfile(CSV_FILENAME)
+    with open(CSV_FILENAME, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        for r in results:
+            writer.writerow(
+                {
+                    "Query": query,
+                    "Rank": r["rank"],
+                    "Act Name": r.get("name_of_statute"),
+                    "Section Number": r.get("section_number"),
+                    "Section Title": r.get("section_title"),
+                    "Snippet": r.get("section_text", "")[:1000],
+                }
+            )
+    print(f" >> Saved {len(results)} rows to {CSV_FILENAME}")
 
-    # Sort by score descending
-    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
-
-def save_to_csv(query, results_list):
-    """
-    Saves the list of result dictionaries to a CSV file.
-    """
-    file_exists = os.path.isfile(CSV_FILENAME)
-    
-    try:
-        with open(CSV_FILENAME, mode='a', newline='', encoding='utf-8') as f:
-            fieldnames = ["Query", "Rank", "Act Name", "Section Number", "Section Title", "Snippet"]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-
-            if not file_exists:
-                writer.writeheader()
-            
-            writer.writerows(results_list)
-            print(f" >> Saved {len(results_list)} rows to {CSV_FILENAME}")
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
-
-def search_central_acts(query_text):
-    print(f"\nSearching Central Acts for: '{query_text}'")
-
-    query_emb = model.encode(query_text).tolist()
-
-    # 1. Vector Search (Central Acts Only)
-    vector_response = app.query(body={
-        "yql": "select * from sources centralacts where ({targetHits:10}nearestNeighbor(embedding,q_emb));",
-        "ranking": "semantic",
-        "input.query(q_emb)": query_emb,
-        "hits": 10
-    })
-    vector_hits = vector_response.hits
-    print(f"   Found {len(vector_hits)} vector matches")
-
-    # 2. BM25 Search (Central Acts Only)
-    bm25_response = app.query(body={
-        "yql": "select * from sources centralacts where userQuery();",
-        "query": query_text,
-        "type": "all",
-        "ranking": "bm25",
-        "hits": 10
-    })
-    bm25_hits = bm25_response.hits
-    print(f"   Found {len(bm25_hits)} BM25 matches")
-
-    # 3. RRF Re-ranking
-    reranked_ids = reciprocal_rank_fusion(vector_hits, bm25_hits, k=RRF_K)
-    top_5_ids = [doc_id for doc_id, score in reranked_ids[:5]]
-
-    print("\n--- Top 5 Central Acts Results ---")
-
-    # Create a lookup map
-    all_hits_map = {h['id']: h for h in vector_hits + bm25_hits}
-    csv_data = []
-
-    for rank, doc_id in enumerate(top_5_ids):
-        doc = all_hits_map.get(doc_id)
-        if doc:
-            fields = doc['fields']
-
-            act_name = fields.get('name_of_statute', 'Unknown Act')
-            sec_num = fields.get('section_number', '?')
-            sec_title = fields.get('section_title', 'Untitled')
-            text = fields.get('section_text', '')
-
-            # Display to console
-            print(f"{rank+1}. [{doc_id}] {act_name} - Section {sec_num}")
-            print(f"   Title: {sec_title}")
-            print(f"   Snippet: {text[:200]}...\n")
-
-            # Prepare for CSV (clean text to avoid CSV breakage)
-            clean_snippet = " ".join(text.split())[:1000]
-            
-            csv_data.append({
-                "Query": query_text,
-                "Rank": rank + 1,
-                "Act Name": act_name,
-                "Section Number": sec_num,
-                "Section Title": sec_title,
-                "Snippet": clean_snippet
-            })
-
-    # 4. Save to CSV
-    if csv_data:
-        save_to_csv(query_text, csv_data)
 
 if __name__ == "__main__":
     try:
         while True:
             user_query = input("Enter search query (or 'exit'): ")
-            if user_query.lower() == 'exit':
+            if user_query.lower() == "exit":
                 break
-            search_central_acts(user_query)
+            results = search_central_acts(user_query)
+            print("\n--- Top Central Acts Results ---")
+            for r in results:
+                print(f"{r['rank']}. {c.statute_title(r)}  (rrf={r['rrf_score']})")
+                print(f"   Title: {r.get('section_title')}")
+                print(f"   Snippet: {r.get('section_text', '')[:200]}...\n")
+            save_to_csv(user_query, results)
     except KeyboardInterrupt:
         print("\nExiting...")

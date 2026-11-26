@@ -55,9 +55,12 @@ def _setup_logger(name: str):
     return logger
 
 
-def _load_raw_test(dataset_dir: str):
+def _load_raw_test(dataset_dir: str, test_file: str = "test_v2.json"):
+    """Load the raw test split.  ``test_file`` may be the offline-RAG output
+    (e.g. test_v2_rag.json), whose retrieved statutes/precedents occupy the
+    same fields the prompt builders read."""
     from datasets import load_dataset
-    path = os.path.join(dataset_dir, "test_v2.json")
+    path = os.path.join(dataset_dir, test_file)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Raw test file not found: {path}")
     return load_dataset("json", data_files={"test": path}, split="test")
@@ -1079,6 +1082,8 @@ def _get_args():
     p.add_argument("--max_new_tokens", type=int, default=4096)
     p.add_argument("--logging_dir", type=str, default="./logs")
     p.add_argument("--dataset_dir", type=str, default="./dataset")
+    p.add_argument("--test_file", type=str, default="test_v2.json",
+                   help="Test file inside dataset_dir; use test_v2_rag.json for retrieved context")
     p.add_argument("--start_case", type=int, default=1,
                    help="1-based case number to start evaluating from")
     p.add_argument("--eval_batch_size", type=int, default=1)
@@ -1258,7 +1263,7 @@ def run_base_eval(args, logger):
     FastLanguageModel.for_inference(model)
 
     # 3. Load dataset
-    all_rows = list(_load_raw_test(args.dataset_dir))
+    all_rows = list(_load_raw_test(args.dataset_dir, args.test_file))
     all_rows = all_rows[args.start_case - 1:]
     n_total = len(all_rows)
     os.makedirs(args.logging_dir, exist_ok=True)

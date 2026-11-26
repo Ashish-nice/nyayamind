@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from endee import Endee  
@@ -9,7 +10,7 @@ query_text = "charge alleging that he had deserted his wife and two school going
 query_vector = model.encode(query_text).tolist()  # Ensure it's a list
 
 print("🔌 Connecting to Endee...")
-client = Endee(token="shubham:NXdEaTCJQEmqnPTKicXNVDFRRvuryuAR")
+client = Endee(token=os.environ["ENDEE_TOKEN"])  # set ENDEE_TOKEN in .env / environment
 client.set_base_url("http://172.27.21.35:8080/api/v1")  # <-- Replace with your actual API token
 print("✅ Connected to Endee.")
 

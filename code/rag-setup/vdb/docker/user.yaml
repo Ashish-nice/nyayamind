@@ -1,0 +1,8 @@
+# Overrides for milvus.yaml (laptop run): memory-map vectors, indexes and
+# scalars so loaded collections do not have to fit in the Docker VM's RAM.
+queryNode:
+  mmap:
+    vectorField: true
+    vectorIndex: true
+    scalarField: true
+    scalarIndex: true

@@ -215,3 +215,8 @@ evaluation_results/
 code/rag-setup/vespa/vespa_app_source/
 *_search_results*.csv
 reports/
+# Local virtual environments (any name) and editor/OS clutter
+.venv*/
+*.zip
+.DS_Store
+Thumbs.db

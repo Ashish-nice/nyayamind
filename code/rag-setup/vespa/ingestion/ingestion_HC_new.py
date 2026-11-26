@@ -1,152 +1,84 @@
+"""Ingest High Court judgments (data/HC/hc_cases_judgements.csv) into `hcjudgments`.
+
+The 9 GB CSV is streamed row by row (never loaded into pandas).
+
+Default (--max-chunks 1) reproduces the paper's Vespa HC collection, which holds
+one document per judgment (811,492 docs): the embedding covers the first
+8192 tokens and BM25 indexes the first 60,000 characters of the judgment.
+Use --max-chunks 0 to index every 8192-token chunk instead (about 3x the GPU
+time). --embed-tokens trades recall for speed on a laptop GPU: e.g. 2048
+embeds only the head of each judgment (parties, facts, issues) and roughly
+halves the embedding time.
+
+Stages (see common.py):
+    --stage embed   chunk + embed -> data/vespa_feed/hcjudgments/
+    --stage feed    push the pre-computed shards into Vespa
+    --stage all     both (default)
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import common as c  # noqa: E402
+
+HC_ROWS = 811493
+BM25_CHARS = 60000
 
 
-import pandas as pd
-import ast
-import unicodedata
-import re
+def make_docs_factory(max_chunks: int, embed_tokens: int):
+    def make_docs(row_index: int, row: dict[str, str], tokenizer):
+        raw = row.get("Text") or ""
+        if max_chunks:
+            # Only the head is embedded; avoid tokenising the whole judgment.
+            raw = raw[: max(BM25_CHARS, embed_tokens * max_chunks * 8)]
+        text = c.preprocess_text(raw, lower=False)
+        if not text:
+            return []
+        metadata = {
+            "case_name": c.preprocess_text(row.get("Title"), lower=False)[:2000],
+            "court_name": c.preprocess_text(row.get("Court Name"), lower=False),
+            "judgment_date": c.preprocess_text(row.get("Decision Date"), lower=False),
+            "citations": c.preprocess_text(row.get("Case Number"), lower=False),
+            "bench": c.preprocess_text(row.get("Judge"), lower=False)[:2000],
+        }
+        if max_chunks == 1:  # one doc per judgment: only the head is tokenised
+            chunks = [c.head_by_tokens(text, tokenizer, embed_tokens)]
+        else:
+            chunks = c.chunk_by_tokens(
+                text, tokenizer, chunk_tokens=embed_tokens, overlap=100, max_chunks=max_chunks or None
+            )
+        docs = []
+        for chunk_index, chunk in enumerate(chunks):
+            doc_id = f"hc_{row_index}_{chunk_index}"
+            stored = text[:BM25_CHARS] if max_chunks == 1 else chunk
+            fields = {"id": doc_id, "chunk_index": chunk_index, "text": stored, **metadata}
+            docs.append((doc_id, fields, chunk))
+        return docs
 
-from sentence_transformers import SentenceTransformer
-from tqdm import tqdm
-from vespa.application import Vespa
-import torch
+    return make_docs
 
 
-# Connect to the local Vespa instance
-app = Vespa(url="http://localhost:8085")
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    c.add_stage_args(parser)
+    parser.add_argument("--max-chunks", type=int, default=1, help="Chunks per judgment; 0 = all (default 1).")
+    args = parser.parse_args()
+    if args.stage in ("embed", "all"):
+        c.run_embedding_stage(
+            c.HC_SCHEMA,
+            enumerate(c.iter_csv(c.HC_CSV)),
+            make_docs_factory(args.max_chunks, args.embed_tokens),
+            total=HC_ROWS,
+            limit=args.limit,
+            docs_per_batch=512,
+        )
+    if args.stage in ("feed", "all"):
+        c.run_feed_stage(c.HC_SCHEMA, follow=args.follow)
 
-# 1. Load Model
-MODEL_NAME = "Snowflake/snowflake-arctic-embed-m-v2.0"
-print(f"Loading model: {MODEL_NAME}...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = SentenceTransformer(MODEL_NAME, device=device, trust_remote_code=True)
-model.max_seq_length = 8192
-
-def preprocess_text(text):
-    if pd.isna(text):
-        return ""
-    text = str(text).replace("\n", " ")
-    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
-    text = text.lower()
-    return ' '.join(text.split())
-
-def clean_and_parse_text(raw_text):
-    """
-    Robust parser that handles messy dictionary strings from CSV.
-    Fixes smart quotes, leading zeros, and truncated strings.
-    """
-    if pd.isna(raw_text):
-        return {}
-
-    s = str(raw_text).strip()
-
-    # Attempt 1: Standard Parse
-    try:
-        return ast.literal_eval(s)
-    except (SyntaxError, ValueError):
-        pass
-
-    # Attempt 2: Clean Common Syntax Errors
-    # Fix smart quotes and ellipses
-    s = s.replace("’", "'").replace("“", '"').replace("”", '"').replace("…", "...")
-
-    # Fix "leading zeros in decimal" error (e.g., Act 05 -> Act 5)
-    # Regex finds zeros preceded by non-digits and followed by digits
-    s = re.sub(r'(?<=\D)0+(\d+)', r'\1', s)
-    s = re.sub(r'^0+(\d+)', r'\1', s)
-
-    try:
-        return ast.literal_eval(s)
-    except Exception:
-        # Attempt 3: Fallback
-        # If parsing as a dict fails completely (e.g., truncated string),
-        # treat the entire raw content as a single chunk rather than discarding it.
-        # We strip the outer brackets if they exist to clean it up slightly.
-        cleaner_s = s.strip("{}")
-        return {"fallback_chunk": cleaner_s}
-
-def feed_data(csv_path, collection_name):
-    """
-    Ingests data from a CSV into a specific Vespa collection (schema).
-    """
-    if not os.path.exists(csv_path):
-        print(f"Warning: File not found: {csv_path}. Skipping.")
-        return
-
-    print(f"\nStarting ingestion for Collection: {collection_name}")
-    print(f"Source: {csv_path}")
-
-    df = pd.read_csv(csv_path)
-    batch_data = []
-
-    for i in tqdm(range(len(df)), desc=f"Processing {collection_name}"):
-        try:
-            # --- USE ROBUST PARSER HERE ---
-            text_chunks = clean_and_parse_text(df['Text'].iloc[i])
-
-            if not text_chunks:
-                continue
-
-            # Metadata
-            case_name = str(df['Title'].iloc[i])[:20000]
-            date = str(df['Decision Date'].iloc[i])[:2000]
-            citation = str(df['Case Number'].iloc[i])[:20000]
-            bench = str(df['Judge'].iloc[i])[:20000]
-
-            for chunk_id, chunk_text in text_chunks.items():
-                clean_text = preprocess_text(chunk_text)
-                if not clean_text:
-                    continue
-
-                embedding = model.encode(clean_text).tolist()
-
-                # Correct Vespa ID format using the Dynamic Collection Name
-                unique_suffix = f"{i}_{chunk_id}"
-                # Format: id:namespace:schema::unique_id
-                doc_id = f"id:{collection_name}:{collection_name}::{unique_suffix}"
-
-                vespa_fields = {
-                    "id": doc_id,
-                    "case_name": case_name,
-                    "judgment_date": date,
-                    "citations": citation,
-                    "bench": bench,
-                    "text": clean_text[:60000],
-                    "embedding": embedding
-                }
-
-                batch_data.append({
-                    "id": doc_id,
-                    "fields": vespa_fields
-                })
-
-                if len(batch_data) >= 100:
-                    app.feed_iterable(
-                        iter=batch_data,
-                        schema=collection_name,     # Dynamic Schema
-                        namespace=collection_name,  # Dynamic Namespace
-                        callback=lambda response, id: None
-                    )
-                    batch_data = []
-
-        except Exception as e:
-            # Now strictly for unexpected errors, not syntax ones
-            print(f"Error processing row {i}: {e}")
-            continue
-
-    # Feed remaining items
-    if batch_data:
-        app.feed_iterable(iter=batch_data, schema=collection_name, namespace=collection_name)
-    print(f"Ingestion complete for {collection_name}.")
 
 if __name__ == "__main__":
-
-    # Mapping of CSV file paths to Vespa Collection Names (Schemas)
-    collection_map = {"/home/shubham/tanmay/lexensemble/code/hc_cases_judgements.csv": "hcjudgments"}
-
-    # Iterate through the dictionary and process each High Court
-    for file_path, collection_name in collection_map.items():
-        try:
-            feed_data(file_path, collection_name)
-        except Exception as main_e:
-            print(f"CRITICAL FAILURE processing {collection_name}: {main_e}")
-            continue
+    main()
