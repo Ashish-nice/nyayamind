@@ -211,3 +211,7 @@ data/
 model/final_model/
 logs/
 evaluation_results/
+# Vespa RAG artifacts
+code/rag-setup/vespa/vespa_app_source/
+*_search_results*.csv
+reports/
